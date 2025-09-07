@@ -122,7 +122,6 @@ class HeteroGNN(tf.keras.Model):
 DEFAULT_MODEL_PATH = "revised_GAT_model_fold1.keras" # repo에 포함
 DEFAULT_SCALER_PATH = "scaler_params.json" # repo에 포함 (JSON or joblib)
 
-
 # 카테고리 라벨 매핑을 코드에 직접 내장(훈련 시 LabelEncoder 결과와 일치해야 함)
 # 카테고리 라벨 매핑(훈련 시 LabelEncoder 결과와 반드시 일치해야 함)
 LABEL_MAPS = {
@@ -131,8 +130,6 @@ LABEL_MAPS = {
 "Corrosive_Irritation_score": {"Negative": 0, "Positive": 1},
 "Emulsifier": {"Not Include Emulsifier": 0, "Include Emulsifier": 1},
 }
-
-
 # 결측/미선택 시 기본 카테고리 (UI 기본값)
 DEFAULT_LABELS = {
 "Skin Type": "human",
@@ -141,9 +138,30 @@ DEFAULT_LABELS = {
 "Emulsifier": "Include Emulsifier",
 }
 
+# 🔹 여기에 화학물질 DB 경로 & 로더 추가
+PROCESSED_XLSX = "processed_test_target.xlsx"  # 레포에 함께 올려두기 (xlsx)
+
+@st.cache_resource
+def load_chemical_db(path: str):
+    if not os.path.exists(path):
+        st.warning(f"화학물질 DB 파일이 없습니다: {path}")
+        return None
+    try:
+        # pandas가 xlsx 읽으려면 requirements에 openpyxl 필요
+        return pd.read_excel(path)
+    except Exception as e:
+        st.error(f"xlsx 로드 실패: {e}")
+        return None
+
 # =========================================
 #  Utilities to load model & scaler (no upload)
 # =========================================
+CUSTOM_OBJECTS = {
+    "HeteroGNN": HeteroGNN,
+    "SelfAttentionEncoder": SelfAttentionEncoder,
+    "GraphAttentionLayer": GraphAttentionLayer,
+}
+
 @st.cache_resource
 def load_model_from_disk(path: str):
     if not os.path.exists(path):
@@ -163,7 +181,7 @@ def load_model_from_disk(path: str):
     except Exception as e:
         st.error(f"모델 로드 실패: {e}")
         st.stop()
-        
+
 @st.cache_resource
 def load_scaler_params_from_disk(path: str):
     if not os.path.exists(path):
@@ -214,47 +232,117 @@ def standardize_from_params(raw_dict, params_df):
 # =========================================
 # App
 # =========================================
+
 st.set_page_config(page_title='Dermal Absorption Rate(%) Prediction', page_icon='🧪', layout='centered')
+# 🔹 여기에서 세션 스토리지 초기화
+if "raw_defaults" not in st.session_state:
+    st.session_state.raw_defaults = {}
+if "cat_defaults" not in st.session_state:
+    st.session_state.cat_defaults = {}
+    
 st.title('🧪 HeteroGNN (Transformer→GAT) Dermal Absorption Prediction')
 
-
 # 고정 경로에서 자동 로드 (업로드 불필요)
-model = tf.keras.models.load_model(
-    DEFAULT_MODEL_PATH,
-    custom_objects={
-        "HeteroGNN": HeteroGNN,
-        "SelfAttentionEncoder": SelfAttentionEncoder,
-        "GraphAttentionLayer": GraphAttentionLayer,
-    },
-    compile=False,
-    safe_mode=False,   # 커스텀 클래스 실행 허용
-)
+model = load_model_from_disk(DEFAULT_MODEL_PATH)
 params_df = load_scaler_params_from_disk(DEFAULT_SCALER_PATH)
-
 
 st.sidebar.success('모델/스케일러: 레포의 기본 파일에서 자동 로드됨')
 output_raw_scale = st.sidebar.checkbox('출력값을 원래 스케일로 변환(expm1)', value=True)
-
 
 PHY_CHEM = ['scaled_Molecular Weight','scaled_LogKow','scaled_TPSA','scaled_Water Solubility','scaled_Melting Point','scaled_Boiling Point','scaled_Vapor Pressure','scaled_Density','Corrosive_Irritation_score']
 VEHICLE = ['Vcl_LP','Emulsifier','scaled_Enhancer_logKow','scaled_Enhancer_vap','Enhancer_ratio']
 SKIN = ['Skin Type','scaled_Skin Thickness']
 EXPER = ['Conc','scaled_Appl_area','scaled_Exposure Time']
 
-
 RAW_FOR_SCALING = ['Molecular Weight','LogKow','TPSA','Water Solubility','Melting Point','Boiling Point','Vapor Pressure','Density','Skin Thickness','Enhancer_logKow','Enhancer_vap','Appl_area','Exposure Time']
 RAW_EXTRAS = ['Init_Load_Area','Vehicle Load','Enhancer_ratio']
 CATS = ['Skin Type','Vcl_LP','Corrosive_Irritation_score','Emulsifier']
 
+st.header("1) 화학물질 검색")
+q_col1, q_col2 = st.columns([2,1])
+with q_col1:
+    q_name = st.text_input("Chemical Name (정확 일치, 대소문자 무시)", "")
+with q_col2:
+    q_cas = st.text_input("CAS (하이픈 무시)", "")
 
+if st.button("검색"):
+    df = load_chemical_db(PROCESSED_XLSX)
+    if df is None or df.empty:
+        st.info("DB가 비어있거나 로드되지 않았습니다.")
+    else:
+        # 컬럼 가정: 'Chemical Name', 'CAS'가 존재
+        # (필요시 다른 이름도 추가 가능)
+        if not {"Chemical Name", "CAS"}.issubset(set(df.columns)):
+            st.error("엑셀에 'Chemical Name' 또는 'CAS' 컬럼이 없습니다.")
+        else:
+            df2 = df.copy()
+
+            # 필터 구성
+            mask = pd.Series(True, index=df2.index)
+            if q_name.strip():
+                mask &= df2["Chemical Name"].astype(str).str.strip().str.lower() == q_name.strip().lower()
+            if q_cas.strip():
+                # CAS 비교 시 하이픈 제거
+                norm = lambda s: str(s).replace("-", "").strip()
+                mask &= df2["CAS"].astype(str).map(norm) == norm(q_cas)
+
+            hits = df2[mask]
+            if hits.empty:
+                st.warning("일치하는 항목이 없습니다.")
+            else:
+                # 첫 번째 매치 사용
+                row = hits.iloc[0]
+                st.success("일치 항목을 찾았어요. 값을 폼에 채워 넣었습니다.")
+                st.dataframe(hits.head(5))
+
+                # 숫자 피처 기본값 주입 (없는 값은 건너뜀)
+                for feat in [
+                    "Molecular Weight","LogKow","TPSA","Water Solubility",
+                    "Melting Point","Boiling Point","Vapor Pressure"
+                ]:
+                    if feat in row and pd.notna(row[feat]):
+                        try:
+                            st.session_state.raw_defaults[feat] = float(row[feat])
+                        except Exception:
+                            pass
+
+                # 카테고리: Corrosive_Irritation_score (텍스트/숫자 모두 대응)
+                cat = "Corrosive_Irritation_score"
+                if cat in row and pd.notna(row[cat]):
+                    val = row[cat]
+                    mapping = LABEL_MAPS.get(cat, {})
+                    # 엑셀에 'Positive'/'Negative' 같은 라벨일 경우
+                    if isinstance(val, str):
+                        label = val.strip()
+                        if label in mapping:
+                            st.session_state.cat_defaults[cat] = label
+                    else:
+                        # 코드가 숫자로 있는 경우 → 라벨 역조회
+                        try:
+                            code = int(val)
+                            inv = {v: k for k, v in mapping.items()}
+                            if code in inv:
+                                st.session_state.cat_defaults[cat] = inv[code]
+                        except Exception:
+                            pass
+                            
 st.header('2) 입력 값')
 with st.form('inp'):
     col1, col2 = st.columns(2)
     raw = {}
-    for i, feat in enumerate(RAW_FOR_SCALING + RAW_EXTRAS):
-        val = (col1 if i % 2 == 0 else col2).number_input(feat, value=0.0, format='%f')
-        raw[feat] = float(val)
 
+    # 🔧 수치 입력: 검색 기본값 → 없으면 0.00, 소수 둘째자리
+    for i, feat in enumerate(RAW_FOR_SCALING + RAW_EXTRAS):
+        default_val = float(st.session_state.raw_defaults.get(feat, 0.00))
+        inp = (col1 if i % 2 == 0 else col2).number_input(
+            feat,
+            value=round(default_val, 2),
+            step=0.01,
+            format="%.2f"
+        )
+        raw[feat] = float(inp)
+
+    # 🔧 카테고리: Corrosive_Irritation_score만 검색으로 바뀔 수 있음
     cat_vals = {}
     for c in CATS:
         mapping = LABEL_MAPS.get(c)
@@ -262,7 +350,9 @@ with st.form('inp'):
             cat_vals[c] = int(st.number_input(f'{c} (정수 코드)', value=0, step=1))
         else:
             choices = list(mapping.keys())
-            default_label = DEFAULT_LABELS.get(c)
+            # 검색으로 주입된 기본 라벨 > 앱 기본 라벨
+            injected = st.session_state.cat_defaults.get(c)
+            default_label = injected if injected in choices else DEFAULT_LABELS.get(c, choices[0])
             default_idx = choices.index(default_label) if default_label in choices else 0
             sel = st.selectbox(c, choices, index=default_idx)
             cat_vals[c] = int(mapping[sel])
