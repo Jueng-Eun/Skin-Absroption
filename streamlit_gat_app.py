@@ -13,8 +13,8 @@ import joblib
 # =========================================
 @tf.keras.utils.register_keras_serializable(package="custom")
 class GraphAttentionLayer(tf.keras.layers.Layer):
-    def __init__(self, out_dim, dropout_rate=0.1):
-        super().__init__()
+    def __init__(self, out_dim, dropout_rate=0.1, **kwargs)):
+        super().__init__(**kwargs)
         self.out_dim = out_dim
         self.dropout_rate = dropout_rate
 
@@ -39,10 +39,20 @@ class GraphAttentionLayer(tf.keras.layers.Layer):
         attn = attn / (tf.reduce_sum(attn, axis=-1, keepdims=True) + 1e-9)
         return tf.matmul(attn, Wh)
 
+    def get_config(self):
+        return {**super().get_config(),
+                "out_dim": self.out_dim, "dropout_rate": self.dropout_rate}
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+        
 @tf.keras.utils.register_keras_serializable(package="custom")
 class SelfAttentionEncoder(tf.keras.layers.Layer):
-    def __init__(self, dim_in, dim_hidden, dim_proj=64, n_heads=4, dropout=0.1):
-        super().__init__()
+    def __init__(self, dim_in, dim_hidden, dim_proj=64, n_heads=4, dropout=0.1, **kwargs)):
+        super().__init__(**kwargs)
+        self.dim_in, self.dim_hidden = dim_in, dim_hidden
+        self.dim_proj, self.n_heads, self.dropout = dim_proj, n_heads, dropout
+        
         self.proj = layers.Dense(dim_proj)
         self.attn = layers.MultiHeadAttention(num_heads=n_heads, key_dim=dim_proj // n_heads, dropout=dropout)
         self.norm = layers.LayerNormalization()
@@ -53,11 +63,19 @@ class SelfAttentionEncoder(tf.keras.layers.Layer):
         attn_out = self.attn(x, x, x, training=training)
         x = self.norm(attn_out)
         return self.ff(x[:, 0])
+
+    def get_config(self):
+        return {**super().get_config(),
+                "dim_in": self.dim_in, "dim_hidden": self.dim_hidden,
+                "dim_proj": self.dim_proj, "n_heads": self.n_heads, "dropout": self.dropout}
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
         
 @tf.keras.utils.register_keras_serializable(package="custom")
 class HeteroGNN(tf.keras.Model):
-    def __init__(self, num_p, num_v, num_s, num_e, dim_hidden=64, ff_dim=128, dropout=0.1):
-        super().__init__()
+    def __init__(self, num_p, num_v, num_s, num_e, dim_hidden=64, ff_dim=128, dropout=0.1, **kwargs)):
+        super().__init__(**kwargs)
         self._init_kwargs = dict(num_p=num_p, num_v=num_v, num_s=num_s, num_e=num_e, dim_hidden=dim_hidden, ff_dim=ff_dim, dropout=dropout)
         self.encoder_p = SelfAttentionEncoder(num_p, dim_hidden, dropout=dropout)
         self.encoder_v = SelfAttentionEncoder(num_v, dim_hidden, dropout=dropout)
@@ -91,6 +109,7 @@ class HeteroGNN(tf.keras.Model):
         return self.mlp(h_flat)[:, 0]
 
     def get_config(self):
+        # Keras 기본 필드 + 우리가 필요한 하이퍼파라미터
         return {**super().get_config(), **self._init_kwargs}
 
     @classmethod
@@ -196,11 +215,20 @@ def standardize_from_params(raw_dict, params_df):
 # App
 # =========================================
 st.set_page_config(page_title='Dermal Absorption Rate(%) Prediction', page_icon='🧪', layout='centered')
-st.title('🧪 HeteroGNN (Transformer→GAT) Dermal Absorption Prediction Model')
+st.title('🧪 HeteroGNN (Transformer→GAT) Dermal Absorption Prediction')
 
 
 # 고정 경로에서 자동 로드 (업로드 불필요)
-model = load_model_from_disk(DEFAULT_MODEL_PATH)
+model = tf.keras.models.load_model(
+    DEFAULT_MODEL_PATH,
+    custom_objects={
+        "HeteroGNN": HeteroGNN,
+        "SelfAttentionEncoder": SelfAttentionEncoder,
+        "GraphAttentionLayer": GraphAttentionLayer,
+    },
+    compile=False,
+    safe_mode=False,   # 커스텀 클래스 실행 허용
+)
 params_df = load_scaler_params_from_disk(DEFAULT_SCALER_PATH)
 
 
