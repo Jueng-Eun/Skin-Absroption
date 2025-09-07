@@ -534,7 +534,7 @@ st.header('2) 입력 값')
 st.caption("※ 입력값은 outliers.xlsx의 하/상한으로 자동 클리핑됩니다. "
            "Water Solubility / Vapor Pressure는 로그값을 입력하세요."
            )
-st.caption("※ 피부두께 정보를 확인할 수 없는 경우 **공란**으로 두고 **예측하기**를 눌러주세요."
+st.caption("※ 피부두께 정보를 확인할 수 없는 경우 **공란**으로 두고 **예측하기**를 눌러주세요.\n"
            "이는 먼저 Human/Dorsal/Whole Skin 기준으로 계산되며, 필요 시 **피부 정보를 변경**할 수 있습니다."
            )
 
