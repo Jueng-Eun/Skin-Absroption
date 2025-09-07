@@ -357,6 +357,32 @@ LOG_DISPLAY = {
     "Vapor Pressure": "log(Vapor Pressure)",
 }
 
+# 단위 정의(필요에 맞게 수정하세요)
+UNITS = {
+    "Molecular Weight": "g/mol",
+    "LogKow": "-",                # 무차원
+    "TPSA": "Å²",
+    "Water Solubility": "log(mol/L)",
+    "Vapor Pressure": "log(mmHg)",
+    "Melting Point": "°C",
+    "Boiling Point": "°C",
+    "Density": "g/mL (at 20°C or 25°C)",
+    "Skin Thickness": "µm",
+    "Enhancer_logKow": "-",       # 무차원 (가정)
+    "Enhancer_vap": "log(Pa)",    # 필요시 수정
+    "Appl_area": "cm²",
+    "Exposure Time": "h",
+    "Init_Load_Area": "µg/cm²",
+    "Vehicle Load": "µg/cm²",
+    "Enhancer_ratio": "(0~1)"         # 비율이면 %, 아니면 적절히 변경
+}
+
+def build_label(feat: str) -> str:
+    """내부 피처명을 화면용 라벨(로그 표기 + 단위)로 변환"""
+    base = LOG_DISPLAY.get(feat, feat)
+    unit = UNITS.get(feat)
+    return f"{base} ({unit})" if unit else base
+    
 st.header("1) 화학물질 검색")
 q_col1, q_col2 = st.columns([2,1])
 with q_col1:
@@ -440,14 +466,9 @@ with st.form('inp'):
     # 수치 입력 (표시는 로그 라벨, 내부 키는 기존 명칭 유지)
     for i, feat in enumerate(RAW_FOR_SCALING + RAW_EXTRAS):
         default_val = float(st.session_state.raw_defaults.get(feat, 0.00))
-        label = LOG_DISPLAY.get(feat, feat)  # 표시는 log(...)로
+        label = build_label(feat)
         container = col1 if i % 2 == 0 else col2
-        inp = container.number_input(
-            label,
-            value=round(default_val, 2),
-            step=0.01,
-            format="%.2f"
-        )
+        inp = container.number_input(label, value=round(default_val, 2), step=0.01, format="%.2f")
 
         # 자동 클리핑 (CLIP_COLS 대상만)
         val = float(inp)
@@ -517,3 +538,4 @@ if submitted:
 
     with st.expander('스케일 파라미터 요약'):
         st.dataframe(params_df)
+
