@@ -13,7 +13,7 @@ import joblib
 # =========================================
 @tf.keras.utils.register_keras_serializable(package="custom")
 class GraphAttentionLayer(tf.keras.layers.Layer):
-    def __init__(self, out_dim, dropout_rate=0.1, **kwargs)):
+    def __init__(self, out_dim, dropout_rate=0.1, **kwargs):
         super().__init__(**kwargs)
         self.out_dim = out_dim
         self.dropout_rate = dropout_rate
