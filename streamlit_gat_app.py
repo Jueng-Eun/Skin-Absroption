@@ -170,11 +170,7 @@ def load_model_from_disk(path: str):
     try:
         return tf.keras.models.load_model(
             path,
-            custom_objects={
-                "HeteroGNN": HeteroGNN,
-                "SelfAttentionEncoder": SelfAttentionEncoder,
-                "GraphAttentionLayer": GraphAttentionLayer,
-            },
+            custom_objects=CUSTOM_OBJECTS,
             compile=False,      # 옵티마이저/메트릭 복원 안함
             safe_mode=False,    # 커스텀 코드 실행 허용 (Keras3에서 중요)
         )
@@ -229,6 +225,74 @@ def standardize_from_params(raw_dict, params_df):
         out[f'scaled_{feat}'] = (x - mean) / std
     return out
 
+# 아웃라이어 자르기
+OUTLIERS_XLSX = "outliers.xlsx"
+# 🔹 클리핑 대상
+CLIP_COLS = ['Molecular Weight', 'Density', 'Melting Point',
+             'Boiling Point', 'Water Solubility', 'Vapor Pressure']
+
+@st.cache_resource
+def load_outlier_limits(path: str) -> dict[str, tuple[float|None, float|None]]:
+    """
+    outliers.xlsx (sheet='upper','lower')에서 각 feature의 (lower, upper) 한계값을 읽어 dict로 반환.
+    - 시트 형태: 각 시트 1행, 컬럼명이 feature 이름, 값은 한계치
+      예) upper 시트: 1행에 각 feature의 상한
+          lower 시트: 1행에 각 feature의 하한
+    """
+    if not os.path.exists(path):
+        st.warning(f"outliers 파일이 없습니다: {path}")
+        return {}
+
+    try:
+        xls = pd.ExcelFile(path)
+        if not set(["upper", "lower"]).issubset(set(xls.sheet_names)):
+            st.error("outliers.xlsx에 'upper'와 'lower' 시트가 모두 있어야 합니다.")
+            return {}
+
+        def _clean(df: pd.DataFrame) -> pd.DataFrame:
+            # to_excel 저장 시 자동 생성되는 인덱스 컬럼 제거
+            drop_cols = [c for c in df.columns if str(c).startswith("Unnamed")]
+            if drop_cols:
+                df = df.drop(columns=drop_cols)
+            return df
+
+        df_u = _clean(pd.read_excel(xls, sheet_name="upper"))
+        df_l = _clean(pd.read_excel(xls, sheet_name="lower"))
+
+        # 1행만 사용 (당신 코드대로면 각 컬럼이 한 개 값)
+        if df_u.empty and df_l.empty:
+            return {}
+
+        row_u = df_u.iloc[0] if not df_u.empty else pd.Series(dtype=float)
+        row_l = df_l.iloc[0] if not df_l.empty else pd.Series(dtype=float)
+
+        limits: dict[str, tuple[float|None, float|None]] = {}
+        for feat in set(row_u.index).union(set(row_l.index)):
+            lo = pd.to_numeric(row_l.get(feat), errors="coerce")
+            hi = pd.to_numeric(row_u.get(feat), errors="coerce")
+            lo = float(lo) if pd.notna(lo) else None
+            hi = float(hi) if pd.notna(hi) else None
+            limits[str(feat).strip()] = (lo, hi)
+
+        return limits
+
+    except Exception as e:
+        st.error(f"outliers.xlsx 로드 실패: {e}")
+        return {}
+
+def clip_with_limits(feat: str, val: float, limits: dict):
+    """limits(dict) 안의 (lower, upper)로 값 클리핑."""
+    if feat not in limits:
+        return val, None
+    lo, hi = limits[feat]
+    clipped = val
+    if lo is not None:
+        clipped = max(clipped, lo)
+    if hi is not None:
+        clipped = min(clipped, hi)
+    changed = (clipped != val)
+    return clipped, (lo, hi) if changed else None
+    
 # =========================================
 # App
 # =========================================
@@ -257,6 +321,12 @@ EXPER = ['Conc','scaled_Appl_area','scaled_Exposure Time']
 RAW_FOR_SCALING = ['Molecular Weight','LogKow','TPSA','Water Solubility','Melting Point','Boiling Point','Vapor Pressure','Density','Skin Thickness','Enhancer_logKow','Enhancer_vap','Appl_area','Exposure Time']
 RAW_EXTRAS = ['Init_Load_Area','Vehicle Load','Enhancer_ratio']
 CATS = ['Skin Type','Vcl_LP','Corrosive_Irritation_score','Emulsifier']
+
+# 🔹 로그로 표시할 컬럼(내부 키 -> UI 라벨)
+LOG_DISPLAY = {
+    "Water Solubility": "log(Water Solubility)",
+    "Vapor Pressure": "log(Vapor Pressure)",
+}
 
 st.header("1) 화학물질 검색")
 q_col1, q_col2 = st.columns([2,1])
@@ -298,7 +368,7 @@ if st.button("검색"):
                 # 숫자 피처 기본값 주입 (없는 값은 건너뜀)
                 for feat in [
                     "Molecular Weight","LogKow","TPSA","Water Solubility",
-                    "Melting Point","Boiling Point","Vapor Pressure"
+                    "Melting Point","Boiling Point","Vapor Pressure","Density"
                 ]:
                     if feat in row and pd.notna(row[feat]):
                         try:
@@ -326,23 +396,43 @@ if st.button("검색"):
                         except Exception:
                             pass
                             
+# 한계값 로드 (앱 시작 시 1회 캐시)
+OUTLIER_LIMITS = load_outlier_limits(OUTLIERS_XLSX)
+
 st.header('2) 입력 값')
+st.caption("※ 입력값은 outliers.xlsx의 하/상한으로 자동 클리핑됩니다. "
+           "Water Solubility / Vapor Pressure는 로그값을 입력하세요.")
+
 with st.form('inp'):
     col1, col2 = st.columns(2)
     raw = {}
+    clipped_notes = []  # 어떤 항목이 클립됐는지 기록(옵션)
 
-    # 🔧 수치 입력: 검색 기본값 → 없으면 0.00, 소수 둘째자리
+    # 수치 입력 (표시는 로그 라벨, 내부 키는 기존 명칭 유지)
     for i, feat in enumerate(RAW_FOR_SCALING + RAW_EXTRAS):
         default_val = float(st.session_state.raw_defaults.get(feat, 0.00))
-        inp = (col1 if i % 2 == 0 else col2).number_input(
-            feat,
+        label = LOG_DISPLAY.get(feat, feat)  # 표시는 log(...)로
+        container = col1 if i % 2 == 0 else col2
+        inp = container.number_input(
+            label,
             value=round(default_val, 2),
             step=0.01,
             format="%.2f"
         )
-        raw[feat] = float(inp)
 
-    # 🔧 카테고리: Corrosive_Irritation_score만 검색으로 바뀔 수 있음
+        # 자동 클리핑 (CLIP_COLS 대상만)
+        val = float(inp)
+        if feat in CLIP_COLS and OUTLIER_LIMITS:
+            val_after, lim = clip_with_limits(feat, val, OUTLIER_LIMITS)
+            if lim is not None:
+                # 사용자가 본 값이 바로 바뀌진 않지만, 내부적으로는 클리핑된 값 사용
+                clipped_notes.append(f"{feat}: 입력 {val:.2f} → 클리핑 {val_after:.2f} "
+                                     f"(범위 {lim[0]} ~ {lim[1]})")
+            val = val_after
+
+        raw[feat] = val
+
+    # 카테고리 입력(기존과 동일)
     cat_vals = {}
     for c in CATS:
         mapping = LABEL_MAPS.get(c)
@@ -350,7 +440,6 @@ with st.form('inp'):
             cat_vals[c] = int(st.number_input(f'{c} (정수 코드)', value=0, step=1))
         else:
             choices = list(mapping.keys())
-            # 검색으로 주입된 기본 라벨 > 앱 기본 라벨
             injected = st.session_state.cat_defaults.get(c)
             default_label = injected if injected in choices else DEFAULT_LABELS.get(c, choices[0])
             default_idx = choices.index(default_label) if default_label in choices else 0
@@ -359,7 +448,13 @@ with st.form('inp'):
 
     submitted = st.form_submit_button('예측하기')
 
+# 예측 뒤 클리핑 로그 보여주기(옵션)
 if submitted:
+    if clipped_notes:
+        with st.expander("클리핑 적용 내역"):
+            for note in clipped_notes:
+                st.write("- " + note)
+
     conc = (raw.get('Init_Load_Area', 0.0) * raw.get('Appl_area', 0.0)) / max(raw.get('Vehicle Load', 1e-9), 1e-9)
     scaled = standardize_from_params(raw, params_df)
 
