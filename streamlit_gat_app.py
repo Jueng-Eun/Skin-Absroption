@@ -357,6 +357,11 @@ LOG_DISPLAY = {
     "Vapor Pressure": "log(Vapor Pressure)",
 }
 
+DISPLAY_NAME = {
+    "Init_Load_Area": "Active Ingredient Load per Area",
+    "Vehicle Load": "Vehicle Load per Area",
+}
+
 # 단위 정의(필요에 맞게 수정하세요)
 UNITS = {
     "Molecular Weight": "g/mol",
@@ -374,12 +379,12 @@ UNITS = {
     "Exposure Time": "h",
     "Init_Load_Area": "µg/cm²",
     "Vehicle Load": "µg/cm²",
-    "Enhancer_ratio": "(0~1)"         # 비율이면 %, 아니면 적절히 변경
+    "Enhancer_ratio": "0~1"         
 }
 
 def build_label(feat: str) -> str:
     """내부 피처명을 화면용 라벨(로그 표기 + 단위)로 변환"""
-    base = LOG_DISPLAY.get(feat, feat)
+    base = LOG_DISPLAY.get(feat, DISPLAY_NAME.get(feat, feat))
     unit = UNITS.get(feat)
     return f"{base} ({unit})" if unit else base
     
