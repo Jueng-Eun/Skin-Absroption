@@ -48,7 +48,7 @@ class GraphAttentionLayer(tf.keras.layers.Layer):
         
 @tf.keras.utils.register_keras_serializable(package="custom")
 class SelfAttentionEncoder(tf.keras.layers.Layer):
-    def __init__(self, dim_in, dim_hidden, dim_proj=64, n_heads=4, dropout=0.1, **kwargs)):
+    def __init__(self, dim_in, dim_hidden, dim_proj=64, n_heads=4, dropout=0.1, **kwargs):
         super().__init__(**kwargs)
         self.dim_in, self.dim_hidden = dim_in, dim_hidden
         self.dim_proj, self.n_heads, self.dropout = dim_proj, n_heads, dropout
@@ -74,7 +74,7 @@ class SelfAttentionEncoder(tf.keras.layers.Layer):
         
 @tf.keras.utils.register_keras_serializable(package="custom")
 class HeteroGNN(tf.keras.Model):
-    def __init__(self, num_p, num_v, num_s, num_e, dim_hidden=64, ff_dim=128, dropout=0.1, **kwargs)):
+    def __init__(self, num_p, num_v, num_s, num_e, dim_hidden=64, ff_dim=128, dropout=0.1, **kwargs):
         super().__init__(**kwargs)
         self._init_kwargs = dict(num_p=num_p, num_v=num_v, num_s=num_s, num_e=num_e, dim_hidden=dim_hidden, ff_dim=ff_dim, dropout=dropout)
         self.encoder_p = SelfAttentionEncoder(num_p, dim_hidden, dropout=dropout)
