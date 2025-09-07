@@ -321,6 +321,69 @@ def clip_with_limits(feat: str, val: float, limits: dict):
         clipped = min(clipped, hi)
     changed = (clipped != val)
     return clipped, (lo, hi) if changed else None
+
+# -------------------------------
+# Skin Thickness 규칙/옵션
+# -------------------------------
+SKIN_SITE_CANON = {
+    "rat": ["abdominal", "dorsal"],
+    "human": ["abdominal", "dorsal", "breast", "abdominal or breast",
+              "abdominal or breast or forearm", "ears", "forearm"],
+    "pig": ["dorsal", "ears"],
+    "guineapig": ["dorsal"],
+    "rabbit": ["dorsal"],
+    "mouse": ["dorsal"],  # 규칙 미정 → 기본값 없음
+}
+
+SKIN_THICKNESS_RULES = {
+    ("rat", "abdominal", "whole"): 1440.0,
+    ("rat", "abdominal", "epidermis"): 11.58,
+    ("rat", "dorsal", "whole"): 1830.0,
+    ("rat", "dorsal", "epidermis"): 21.66,
+
+    ("human", "ears", "whole"): 1399.83,
+    ("human", "ears", "epidermis"): 84.96,
+    ("human", "forearm", "whole"): 1500.0,
+    ("human", "forearm", "epidermis"): 36.0,
+    ("human", "abdominal", "whole"): 2775.0,
+    ("human", "abdominal", "epidermis"): 49.05,
+    ("human", "dorsal", "whole"): 2775.0,
+    ("human", "dorsal", "epidermis"): 49.05,
+    ("human", "breast", "whole"): 2775.0,
+    ("human", "breast", "epidermis"): 49.05,
+    ("human", "abdominal or breast", "whole"): 2775.0,
+    ("human", "abdominal or breast", "epidermis"): 49.05,
+    ("human", "abdominal or breast or forearm", "whole"): 2775.0,
+    ("human", "abdominal or breast or forearm", "epidermis"): 49.05,
+
+    ("pig", "dorsal", "whole"): 3400.0,
+    ("pig", "dorsal", "epidermis"): 66.0,
+    ("pig", "ears", "whole"): 1300.0,
+    ("pig", "ears", "epidermis"): 50.0,
+
+    ("guineapig", "dorsal", "whole"): 1150.0,
+    ("guineapig", "dorsal", "epidermis"): 20.8,
+
+    ("rabbit", "dorsal", "whole"): 1830.0,
+    ("rabbit", "dorsal", "epidermis"): 21.66,
+}
+
+def _norm_site(site: str | None) -> str:
+    """엑셀 전처리와 동일: 좌우공백 제거, ' forearm' -> 'forearm' 등 통일"""
+    s = (site or "").strip().lower()
+    return s
+
+def infer_skin_thickness(skin_type_label: str, skin_site: str | None, layer: str | None) -> float | None:
+    """(Skin Type 라벨, site, layer)로 µm 값을 추론. 규칙 없으면 None."""
+    stype = (skin_type_label or "").strip().lower()
+    site = _norm_site(skin_site)
+    lyr = (layer or "whole").strip().lower()
+    if lyr not in ("whole", "epidermis"):
+        lyr = "whole"
+    # site 비었으면 규칙에서 NaN을 dorsal로 처리했던 케이스를 반영해 기본 'dorsal'
+    if not site:
+        site = "dorsal"
+    return SKIN_THICKNESS_RULES.get((stype, site, lyr))
     
 # =========================================
 # App
@@ -464,33 +527,78 @@ st.caption("※ 입력값은 outliers.xlsx의 하/상한으로 자동 클리핑�
            "Water Solubility / Vapor Pressure는 로그값을 입력하세요.")
 
 with st.form('inp'):
-    col1, col2 = st.columns(2)
+    colA, colB = st.columns(2)
     raw = {}
-    clipped_notes = []  # 어떤 항목이 클립됐는지 기록(옵션)
+    clipped_notes = []
 
-    # 수치 입력 (표시는 로그 라벨, 내부 키는 기존 명칭 유지)
+    # --- 2-1) Skin Thickness 입력 방식 선택 ---
+    mode = st.radio(
+        "Skin Thickness 입력 방식",
+        ["직접 입력", "모름 → 규칙으로 자동계산"],
+        index=0,
+        horizontal=True
+    )
+
+    # 규칙 기반으로 계산된 두께(없으면 None)
+    inferred_thick = None
+    # 자동계산 모드일 때만 타입/부위/층 선택 UI 노출
+    if mode.endswith("자동계산"):
+        # Skin Type 라벨(두께 계산용)
+        stype_choices = list(LABEL_MAPS["Skin Type"].keys())
+        injected = st.session_state.cat_defaults.get("Skin Type")
+        stype_default_label = injected if injected in stype_choices else DEFAULT_LABELS.get("Skin Type", stype_choices[0])
+        stype_idx = stype_choices.index(stype_default_label) if stype_default_label in stype_choices else 0
+        sel_skin_type_label = colA.selectbox("Skin Type (두께 계산용)", stype_choices, index=stype_idx)
+
+        # Layer 선택 (whole/epidermis)
+        sel_layer = colB.selectbox("Skin Layer", ["whole", "epidermis"], index=0)
+
+        # Site 선택 (종별 옵션 제공, 없으면 dorsal)
+        site_opts = SKIN_SITE_CANON.get(sel_skin_type_label, ["dorsal"])
+        sel_site = colA.selectbox("Skin Site", site_opts, index=(site_opts.index("dorsal") if "dorsal" in site_opts else 0))
+
+        # 규칙 기반 두께 계산
+        inferred_thick = infer_skin_thickness(sel_skin_type_label, sel_site, sel_layer)
+
+        # 카테고리 선택 기본값에도 반영(아래 CATS 블록에서 사용)
+        st.session_state.cat_defaults["Skin Type"] = sel_skin_type_label
+
+        # 계산 결과 빠르게 보여주기
+        colB.metric("계산된 Skin Thickness (µm)", f"{inferred_thick:.2f}" if inferred_thick is not None else "규칙 없음")
+
+    # --- 2-2) 수치 입력들 ---
+    # 'Skin Thickness'만 모드에 따라 처리(자동계산이면 비활성/고정, 아니면 직접 입력)
     for i, feat in enumerate(RAW_FOR_SCALING + RAW_EXTRAS):
+        container = colA if i % 2 == 0 else colB
         default_val = float(st.session_state.raw_defaults.get(feat, 0.00))
-        label = build_label(feat)
-        container = col1 if i % 2 == 0 else col2
-        inp = container.number_input(label, value=round(default_val, 2), step=0.01, format="%.2f")
 
-        # 자동 클리핑 (CLIP_COLS 대상만)
-        val = float(inp)
+        if feat == "Skin Thickness" and inferred_thick is not None:
+            # 자동계산 모드: 읽기전용으로 표시하고 내부 값은 계산치 사용
+            container.number_input(build_label(feat), value=round(inferred_thick, 2), step=0.01, format="%.2f", disabled=True)
+            val = float(inferred_thick)
+        else:
+            # 일반 케이스: 직접 입력
+            val = float(container.number_input(build_label(feat), value=round(default_val, 2), step=0.01, format="%.2f"))
+
+        # outliers.xlsx 범위로 클리핑
         if feat in CLIP_COLS and OUTLIER_LIMITS:
             val_after, lim = clip_with_limits(feat, val, OUTLIER_LIMITS)
             if lim is not None:
-                # 사용자가 본 값이 바로 바뀌진 않지만, 내부적으로는 클리핑된 값 사용
-                clipped_notes.append(f"{feat}: 입력 {val:.2f} → 클리핑 {val_after:.2f} "
-                                     f"(범위 {lim[0]} ~ {lim[1]})")
+                clipped_notes.append(f"{feat}: 입력 {val:.2f} → 클리핑 {val_after:.2f} (범위 {lim[0]} ~ {lim[1]})")
             val = val_after
 
         raw[feat] = val
 
-    # 카테고리 입력(기존과 동일)
+    # --- 2-3) 카테고리 입력 ---
     cat_vals = {}
     for c in CATS:
         mapping = LABEL_MAPS.get(c)
+
+        # 자동계산 모드에서는 'Skin Type' 카테고리값을 위 선택으로 고정(별도 셀렉트 숨김)
+        if c == "Skin Type" and mode.endswith("자동계산"):
+            cat_vals[c] = int(LABEL_MAPS[c][st.session_state.cat_defaults["Skin Type"]])
+            continue
+
         if mapping is None:
             cat_vals[c] = int(st.number_input(f'{c} (정수 코드)', value=0, step=1))
         else:
@@ -503,7 +611,7 @@ with st.form('inp'):
 
     submitted = st.form_submit_button('예측하기')
 
-# 예측 뒤 클리핑 로그 보여주기(옵션)
+# --- 제출 후 ---
 if submitted:
     if clipped_notes:
         with st.expander("클리핑 적용 내역"):
@@ -535,11 +643,20 @@ if submitted:
     if output_raw_scale:
         st.write(f"원 스케일 예측값 (expm1): **{np.expm1(y_pred):.4f}**")
 
-    with st.expander('디버그: 입력 벡터 확인'):
-        st.json({'x_p': dict(zip(PHY_CHEM, x_p)),
-                 'x_v': dict(zip(VEHICLE, x_v)),
-                 'x_s': dict(zip(SKIN, x_s)),
-                 'x_e': dict(zip(EXPER, x_e))})
+    # 선택 메타도 함께 확인하고 싶다면:
+    with st.expander('디버그: 입력 벡터 & 선택값'):
+        st.json({
+            'skin_meta': {
+                'Mode': mode,
+                # 자동계산 모드일 때만 아래 키가 존재하도록 안전 처리
+                # (없으면 None로 표기)
+                'Skin Type (for thickness)': st.session_state.cat_defaults.get("Skin Type"),
+            },
+            'x_p': dict(zip(PHY_CHEM, x_p)),
+            'x_v': dict(zip(VEHICLE, x_v)),
+            'x_s': dict(zip(SKIN, x_s)),
+            'x_e': dict(zip(EXPER, x_e))
+        })
 
     with st.expander('스케일 파라미터 요약'):
         st.dataframe(params_df)
