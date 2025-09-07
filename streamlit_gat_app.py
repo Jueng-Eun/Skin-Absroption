@@ -270,21 +270,21 @@ if st.button("검색"):
     if df is None or df.empty:
         st.info("DB가 비어있거나 로드되지 않았습니다.")
     else:
-        # 컬럼 가정: 'Chemical Name', 'CAS'가 존재
+        # 컬럼 가정: 'name', 'cas'가 존재
         # (필요시 다른 이름도 추가 가능)
-        if not {"Chemical Name", "CAS"}.issubset(set(df.columns)):
-            st.error("엑셀에 'Chemical Name' 또는 'CAS' 컬럼이 없습니다.")
+        if not {"name", "cas"}.issubset(set(df.columns)):
+            st.error("엑셀에 'name' 또는 'cas' 컬럼이 없습니다.")
         else:
             df2 = df.copy()
 
             # 필터 구성
             mask = pd.Series(True, index=df2.index)
             if q_name.strip():
-                mask &= df2["Chemical Name"].astype(str).str.strip().str.lower() == q_name.strip().lower()
+                mask &= df2["name"].astype(str).str.strip().str.lower() == q_name.strip().lower()
             if q_cas.strip():
                 # CAS 비교 시 하이픈 제거
                 norm = lambda s: str(s).replace("-", "").strip()
-                mask &= df2["CAS"].astype(str).map(norm) == norm(q_cas)
+                mask &= df2["cas"].astype(str).map(norm) == norm(q_cas)
 
             hits = df2[mask]
             if hits.empty:
