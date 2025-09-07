@@ -212,57 +212,57 @@ CATS = ['Skin Type','Vcl_LP','Corrosive_Irritation_score','Emulsifier']
 
 st.header('2) 입력 값')
 with st.form('inp'):
-col1, col2 = st.columns(2)
-raw = {}
-for i, feat in enumerate(RAW_FOR_SCALING + RAW_EXTRAS):
-val = (col1 if i % 2 == 0 else col2).number_input(feat, value=0.0, format='%f')
-raw[feat] = float(val)
+    col1, col2 = st.columns(2)
+    raw = {}
+    for i, feat in enumerate(RAW_FOR_SCALING + RAW_EXTRAS):
+        val = (col1 if i % 2 == 0 else col2).number_input(feat, value=0.0, format='%f')
+        raw[feat] = float(val)
 
+    cat_vals = {}
+    for c in CATS:
+        mapping = LABEL_MAPS.get(c)
+        if mapping is None:
+            cat_vals[c] = int(st.number_input(f'{c} (정수 코드)', value=0, step=1))
+        else:
+            choices = list(mapping.keys())
+            default_label = DEFAULT_LABELS.get(c)
+            default_idx = choices.index(default_label) if default_label in choices else 0
+            sel = st.selectbox(c, choices, index=default_idx)
+            cat_vals[c] = int(mapping[sel])
 
-cat_vals = {}
-for c in CATS:
-mapping = LABEL_MAPS.get(c)
-if mapping is None:
-cat_vals[c] = int(st.number_input(f'{c} (정수 코드)', value=0, step=1))
-else:
-choices = list(mapping.keys())
-# 기본 라벨을 선택하도록 index 지정
-default_label = DEFAULT_LABELS.get(c)
-default_idx = choices.index(default_label) if default_label in choices else 0
-sel = st.selectbox(c, choices, index=default_idx)
-cat_vals[c] = int(mapping[sel])
-
-
-submitted = st.form_submit_button('예측하기')
-
+    submitted = st.form_submit_button('예측하기')
 
 if submitted:
-conc = (raw.get('Init_Load_Area', 0.0) * raw.get('Appl_area', 0.0)) / max(raw.get('Vehicle Load', 1e-9), 1e-9)
-scaled = standardize_from_params(raw, params_df)
+    conc = (raw.get('Init_Load_Area', 0.0) * raw.get('Appl_area', 0.0)) / max(raw.get('Vehicle Load', 1e-9), 1e-9)
+    scaled = standardize_from_params(raw, params_df)
 
+    x_p = [scaled.get('scaled_Molecular Weight', 0.0), scaled.get('scaled_LogKow', 0.0),
+           scaled.get('scaled_TPSA', 0.0), scaled.get('scaled_Water Solubility', 0.0),
+           scaled.get('scaled_Melting Point', 0.0), scaled.get('scaled_Boiling Point', 0.0),
+           scaled.get('scaled_Vapor Pressure', 0.0), scaled.get('scaled_Density', 0.0),
+           float(cat_vals['Corrosive_Irritation_score'])]
+    x_v = [float(cat_vals['Vcl_LP']), float(cat_vals['Emulsifier']),
+           scaled.get('scaled_Enhancer_logKow', 0.0), scaled.get('scaled_Enhancer_vap', 0.0),
+           float(raw.get('Enhancer_ratio', 0.0))]
+    x_s = [float(cat_vals['Skin Type']), scaled.get('scaled_Skin Thickness', 0.0)]
+    x_e = [float(conc), scaled.get('scaled_Appl_area', 0.0), scaled.get('scaled_Exposure Time', 0.0)]
 
-x_p = [scaled.get('scaled_Molecular Weight', 0.0), scaled.get('scaled_LogKow', 0.0), scaled.get('scaled_TPSA', 0.0), scaled.get('scaled_Water Solubility', 0.0), scaled.get('scaled_Melting Point', 0.0), scaled.get('scaled_Boiling Point', 0.0), scaled.get('scaled_Vapor Pressure', 0.0), scaled.get('scaled_Density', 0.0), float(cat_vals['Corrosive_Irritation_score'])]
-x_v = [float(cat_vals['Vcl_LP']), float(cat_vals['Emulsifier']), scaled.get('scaled_Enhancer_logKow', 0.0), scaled.get('scaled_Enhancer_vap', 0.0), float(raw.get('Enhancer_ratio', 0.0))]
-x_s = [float(cat_vals['Skin Type']), scaled.get('scaled_Skin Thickness', 0.0)]
-x_e = [float(conc), scaled.get('scaled_Appl_area', 0.0), scaled.get('scaled_Exposure Time', 0.0)]
+    Xp = np.array([x_p], dtype=np.float32)
+    Xv = np.array([x_v], dtype=np.float32)
+    Xs = np.array([x_s], dtype=np.float32)
+    Xe = np.array([x_e], dtype=np.float32)
 
+    y_pred = model.predict([Xp, Xv, Xs, Xe], verbose=0).reshape(-1)[0]
+    st.subheader('결과')
+    st.write(f"로그 스케일 예측값: **{y_pred:.4f}**")
+    if output_raw_scale:
+        st.write(f"원 스케일 예측값 (expm1): **{np.expm1(y_pred):.4f}**")
 
-Xp = np.array([x_p], dtype=np.float32)
-Xv = np.array([x_v], dtype=np.float32)
-Xs = np.array([x_s], dtype=np.float32)
-Xe = np.array([x_e], dtype=np.float32)
+    with st.expander('디버그: 입력 벡터 확인'):
+        st.json({'x_p': dict(zip(PHY_CHEM, x_p)),
+                 'x_v': dict(zip(VEHICLE, x_v)),
+                 'x_s': dict(zip(SKIN, x_s)),
+                 'x_e': dict(zip(EXPER, x_e))})
 
-
-y_pred = model.predict([Xp, Xv, Xs, Xe], verbose=0).reshape(-1)[0]
-st.subheader('결과')
-st.write(f"로그 스케일 예측값: **{y_pred:.4f}**")
-if output_raw_scale:
-st.write(f"원 스케일 예측값 (expm1): **{np.expm1(y_pred):.4f}**")
-
-
-with st.expander('디버그: 입력 벡터 확인'):
-st.json({'x_p': dict(zip(PHY_CHEM, x_p)), 'x_v': dict(zip(VEHICLE, x_v)), 'x_s': dict(zip(SKIN, x_s)), 'x_e': dict(zip(EXPER, x_e))})
-
-
-with st.expander('스케일 파라미터 요약'):
-st.dataframe(params_df)
+    with st.expander('스케일 파라미터 요약'):
+        st.dataframe(params_df)
