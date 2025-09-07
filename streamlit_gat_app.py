@@ -11,6 +11,7 @@ import joblib
 # =========================================
 #  Custom layers / model (MUST match training)
 # =========================================
+@tf.keras.utils.register_keras_serializable(package="custom")
 class GraphAttentionLayer(tf.keras.layers.Layer):
     def __init__(self, out_dim, dropout_rate=0.1):
         super().__init__()
@@ -38,6 +39,7 @@ class GraphAttentionLayer(tf.keras.layers.Layer):
         attn = attn / (tf.reduce_sum(attn, axis=-1, keepdims=True) + 1e-9)
         return tf.matmul(attn, Wh)
 
+@tf.keras.utils.register_keras_serializable(package="custom")
 class SelfAttentionEncoder(tf.keras.layers.Layer):
     def __init__(self, dim_in, dim_hidden, dim_proj=64, n_heads=4, dropout=0.1):
         super().__init__()
@@ -51,7 +53,8 @@ class SelfAttentionEncoder(tf.keras.layers.Layer):
         attn_out = self.attn(x, x, x, training=training)
         x = self.norm(attn_out)
         return self.ff(x[:, 0])
-
+        
+@tf.keras.utils.register_keras_serializable(package="custom")
 class HeteroGNN(tf.keras.Model):
     def __init__(self, num_p, num_v, num_s, num_e, dim_hidden=64, ff_dim=128, dropout=0.1):
         super().__init__()
@@ -127,15 +130,21 @@ def load_model_from_disk(path: str):
     if not os.path.exists(path):
         st.error(f"모델 파일이 없습니다: {path}")
         st.stop()
-    return tf.keras.models.load_model(
-        path,
-        custom_objects={
-            'HeteroGNN': HeteroGNN,
-            'SelfAttentionEncoder': SelfAttentionEncoder,
-            'GraphAttentionLayer': GraphAttentionLayer
-        }
-    )
-
+    try:
+        return tf.keras.models.load_model(
+            path,
+            custom_objects={
+                "HeteroGNN": HeteroGNN,
+                "SelfAttentionEncoder": SelfAttentionEncoder,
+                "GraphAttentionLayer": GraphAttentionLayer,
+            },
+            compile=False,      # 옵티마이저/메트릭 복원 안함
+            safe_mode=False,    # 커스텀 코드 실행 허용 (Keras3에서 중요)
+        )
+    except Exception as e:
+        st.error(f"모델 로드 실패: {e}")
+        st.stop()
+        
 @st.cache_resource
 def load_scaler_params_from_disk(path: str):
     if not os.path.exists(path):
