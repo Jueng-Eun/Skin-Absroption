@@ -397,6 +397,14 @@ if "cat_defaults" not in st.session_state:
     st.session_state.cat_defaults = {}
     
 st.title('🧪 HeteroGNN (Transformer→GAT) Dermal Absorption Prediction')
+st.markdown(
+    """
+**모델 안내**  
+이 모델은 **유효성분 도포량 100 µg/cm² 기준**에서 피부흡수율(%) 예측 값을 제공합니다.
+유효성분 도포량이 이와 크게 차이나는 경우 예측값이 부정확할 수 있습니다.
+아래에는 사용할 **시험 조건**과 **물질의 특성**을 입력해 주세요.
+"""
+)
 
 # 고정 경로에서 자동 로드 (업로드 불필요)
 model = load_model_from_disk(DEFAULT_MODEL_PATH)
