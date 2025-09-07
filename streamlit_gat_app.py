@@ -227,55 +227,84 @@ def standardize_from_params(raw_dict, params_df):
 
 # 아웃라이어 자르기
 OUTLIERS_XLSX = "outliers.xlsx"
-# 🔹 클리핑 대상
 CLIP_COLS = ['Molecular Weight', 'Density', 'Melting Point',
              'Boiling Point', 'Water Solubility', 'Vapor Pressure']
 
 @st.cache_resource
-def load_outlier_limits(path: str) -> dict[str, tuple[float|None, float|None]]:
+def load_outlier_limits(path: str, clip_cols=None):
     """
-    outliers.xlsx (sheet='upper','lower')에서 각 feature의 (lower, upper) 한계값을 읽어 dict로 반환.
-    - 시트 형태: 각 시트 1행, 컬럼명이 feature 이름, 값은 한계치
-      예) upper 시트: 1행에 각 feature의 상한
-          lower 시트: 1행에 각 feature의 하한
+    새 형식:
+      - 단일 시트(기본 Sheet1)
+      - 0행: upper(상한), 1행: lower(하한)
+      - 컬럼: feature 명
+    구형 형식(백워드 호환):
+      - 'upper' / 'lower' 시트, 각 시트의 1행에 값
+    반환: { feature: (lower, upper) }
     """
     if not os.path.exists(path):
         st.warning(f"outliers 파일이 없습니다: {path}")
         return {}
 
+    def _clean(df: pd.DataFrame) -> pd.DataFrame:
+        # to_excel 기본 인덱스 열 제거
+        drop_cols = [c for c in df.columns if str(c).startswith("Unnamed")]
+        if drop_cols:
+            df = df.drop(columns=drop_cols)
+        # 모든 값을 숫자로 변환 시도 (문자 저장 대비)
+        for c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df
+
     try:
+        # 1) 새 형식 시도 (단일 시트, 0:upper / 1:lower)
+        df = _clean(pd.read_excel(path))  # 첫 시트
+        # 필요한 컬럼만 남기기(있을 때)
+        if clip_cols:
+            keep = [c for c in df.columns if c in clip_cols]
+            if keep:
+                df = df[keep]
+        if len(df) >= 2 and df.shape[1] > 0:
+            upper_row = df.iloc[0]
+            lower_row = df.iloc[1]
+            limits = {}
+            for feat in df.columns:
+                hi = upper_row.get(feat)
+                lo = lower_row.get(feat)
+                hi = float(hi) if pd.notna(hi) else None
+                lo = float(lo) if pd.notna(lo) else None
+                limits[str(feat).strip()] = (lo, hi)  # (lower, upper)
+            # 새 형식이 유효하면 바로 반환
+            if any(v is not None for pair in limits.values() for v in pair):
+                return limits
+
+        # 2) 구형 형식 폴백 (upper/lower 시트)
         xls = pd.ExcelFile(path)
-        if not set(["upper", "lower"]).issubset(set(xls.sheet_names)):
-            st.error("outliers.xlsx에 'upper'와 'lower' 시트가 모두 있어야 합니다.")
-            return {}
+        if set(["upper", "lower"]).issubset(set(xls.sheet_names)):
+            df_u = _clean(pd.read_excel(xls, sheet_name="upper"))
+            df_l = _clean(pd.read_excel(xls, sheet_name="lower"))
+            if not df_u.empty:
+                row_u = df_u.iloc[0]
+            else:
+                row_u = pd.Series(dtype=float)
+            if not df_l.empty:
+                row_l = df_l.iloc[0]
+            else:
+                row_l = pd.Series(dtype=float)
+            # 교집합 컬럼만
+            cols = set(row_u.index) | set(row_l.index)
+            if clip_cols:
+                cols &= set(clip_cols)
+            limits = {}
+            for feat in cols:
+                hi = row_u.get(feat)
+                lo = row_l.get(feat)
+                hi = float(hi) if pd.notna(hi) else None
+                lo = float(lo) if pd.notna(lo) else None
+                limits[str(feat).strip()] = (lo, hi)
+            return limits
 
-        def _clean(df: pd.DataFrame) -> pd.DataFrame:
-            # to_excel 저장 시 자동 생성되는 인덱스 컬럼 제거
-            drop_cols = [c for c in df.columns if str(c).startswith("Unnamed")]
-            if drop_cols:
-                df = df.drop(columns=drop_cols)
-            return df
-
-        df_u = _clean(pd.read_excel(xls, sheet_name="upper"))
-        df_l = _clean(pd.read_excel(xls, sheet_name="lower"))
-
-        # 1행만 사용 (당신 코드대로면 각 컬럼이 한 개 값)
-        if df_u.empty and df_l.empty:
-            return {}
-
-        row_u = df_u.iloc[0] if not df_u.empty else pd.Series(dtype=float)
-        row_l = df_l.iloc[0] if not df_l.empty else pd.Series(dtype=float)
-
-        limits: dict[str, tuple[float|None, float|None]] = {}
-        for feat in set(row_u.index).union(set(row_l.index)):
-            lo = pd.to_numeric(row_l.get(feat), errors="coerce")
-            hi = pd.to_numeric(row_u.get(feat), errors="coerce")
-            lo = float(lo) if pd.notna(lo) else None
-            hi = float(hi) if pd.notna(hi) else None
-            limits[str(feat).strip()] = (lo, hi)
-
-        return limits
-
+        st.error("outliers.xlsx 형식을 해석할 수 없습니다.")
+        return {}
     except Exception as e:
         st.error(f"outliers.xlsx 로드 실패: {e}")
         return {}
