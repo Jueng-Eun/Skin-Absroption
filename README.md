@@ -1,48 +1,59 @@
-```mermaid
 flowchart TD
-  %% ===== Inputs =====
-  subgraph IN[Inputs]
-    direction LR
-    Xp[x_p] --- Xv[x_v] --- Xs[x_s] --- Xe[x_e]
+  %% Inputs
+  Xp[x_p (B, num_p)] --> Ep
+  Xv[x_v (B, num_v)] --> Ev
+  Xs[x_s (B, num_s)] --> Es
+  Xe[x_e (B, num_e)] --> Ee
+
+  %% Encoders
+  subgraph Ep[SelfAttentionEncoder_p]
+    Ep1[Dense proj -> D_proj=64] --> Ep2[MHA: heads=4, key_dim=64] --> Ep3[LayerNorm] --> Ep4[FF: Dense(dim_hidden, ReLU)]
   end
 
-  %% ===== Encoders (collapsed) =====
-  subgraph ENC[Self-attention encoder x4]
-    direction TB
-    E0[Proj + MHA + LN + FFN]
-    Note1[Applied separately to each input type]:::note
+  subgraph Ev[SelfAttentionEncoder_v]
+    Ev1[Dense proj -> D_proj=64] --> Ev2[MHA: heads=4, key_dim=64] --> Ev3[LayerNorm] --> Ev4[FF: Dense(dim_hidden, ReLU)]
   end
 
-  %% ===== Node stack =====
-  subgraph STK[Compact hetero-graph]
-    direction TB
-    S1[Stack 4 node embeddings]
-    S2[h_nodes with 4 nodes]
+  subgraph Es[SelfAttentionEncoder_s]
+    Es1[Dense proj -> D_proj=64] --> Es2[MHA: heads=4, key_dim=64] --> Es3[LayerNorm] --> Es4[FF: Dense(dim_hidden, ReLU)]
   end
 
-  %% ===== Learnable adjacency =====
-  subgraph ADJ[Learnable adjacency A]
-    direction TB
-    A0[A_logits]
-    A1[Sigmoid]
-    A2[Symmetrize]
-    A3[Zero diagonal]
-    A4[Broadcast to batch]
-    A0 --> A1 --> A2 --> A3 --> A4
+  subgraph Ee[SelfAttentionEncoder_e]
+    Ee1[Dense proj -> D_proj=64] --> Ee2[MHA: heads=4, key_dim=64] --> Ee3[LayerNorm] --> Ee4[FF: Dense(dim_hidden, ReLU)]
   end
 
-  %% ===== Message passing + Head =====
-  GAT[GAT layer]
-  FLT[Flatten]
-  MLP[MLP]
-  OUT[y_hat]
+  Ep --> Hp[h_p (B,D)]
+  Ev --> Hv[h_v (B,D)]
+  Es --> Hs[h_s (B,D)]
+  Ee --> He[h_e (B,D)]
 
-  %% ===== Data flow =====
-  IN --> ENC --> S1 --> S2 --> GAT --> FLT --> MLP --> OUT
+  %% Stack nodes
+  Hp --> Stack[Stack nodes: h_nodes = [p,v,s,e] -> (B,4,D)]
+  Hv --> Stack
+  Hs --> Stack
+  He --> Stack
 
-  %% ===== Parameter flow (dashed) =====
-  A4 -.-> GAT
+  %% Learnable adjacency
+  subgraph Adj[Learnable adjacency]
+    A0[A_logits (4x4), trainable] --> A1[sigmoid -> A_prob (4x4)]
+    A1 --> A2[symmetrize: (A + A^T)/2]
+    A2 --> A3[zero diagonal: A*(1-I)]
+    A3 --> A4[broadcast -> adj_batch (B,4,4)]
+  end
 
-  %% ===== Styling =====
-  classDef note fill:#ffffff,stroke:#bbbbbb,stroke-dasharray: 3 3,color:#444444;
-```
+  Stack --> GAT
+  Adj --> GAT
+
+  %% GAT + MLP
+  subgraph GAT[GraphAttentionLayer]
+    G1[Linear: Wh = hW -> (B,4,D)] --> G2[Attention logits e_ij]
+    G2 --> G3[Mask with adj_batch]
+    G3 --> G4[softmax over j]
+    G4 --> G5[Weighted sum -> h_gnn (B,4,D)]
+  end
+
+  GAT --> Flat[Flatten: reshape -> (B,4D)]
+  Flat --> MLP1[Dropout]
+  MLP1 --> MLP2[Dense(ff_dim, ReLU)]
+  MLP2 --> MLP3[Dropout]
+  MLP3 --> Out[Dense(1) -> y_hat (B,)]
