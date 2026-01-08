@@ -1,63 +1,66 @@
 ```mermaid
 graph TD
-    Xp[x_p] --> EncP[Encoder_p]
-    Xv[x_v] --> EncV[Encoder_v]
-    Xs[x_s] --> EncS[Encoder_s]
-    Xe[x_e] --> EncE[Encoder_e]
 
-    subgraph SAGP[SelfAttentionEncoder_p]
-        P1[Dense proj -> 64] --> P2[MHA heads 4 keydim 64] --> P3[LayerNorm] --> P4[FF Dense dim_hidden ReLU]
-    end
+%% Inputs (tensors/objects)
+Xp[x_p (B, F_p)]:::obj
+Xv[x_v (B, F_v)]:::obj
+Xs[x_s (B, F_s)]:::obj
+Xe[x_e (B, F_e)]:::obj
 
-    subgraph SAGV[SelfAttentionEncoder_v]
-        V1[Dense proj -> 64] --> V2[MHA heads 4 keydim 64] --> V3[LayerNorm] --> V4[FF Dense dim_hidden ReLU]
-    end
+%% 4 separate encoder blocks (operations)
+subgraph EP[Encoder P]
+  direction LR
+  P1[Dense proj (F_p, 64)]:::fn --> P2[Self-attn 4h (64, 64)]:::fn --> P3[LayerNorm (64)]:::fn --> P4[FFN ReLU (64, D)]:::fn
+end
 
-    subgraph SAGS[SelfAttentionEncoder_s]
-        S1[Dense proj -> 64] --> S2[MHA heads 4 keydim 64] --> S3[LayerNorm] --> S4[FF Dense dim_hidden ReLU]
-    end
+subgraph EV[Encoder V]
+  direction LR
+  V1[Dense proj (F_v, 64)]:::fn --> V2[Self-attn 4h (64, 64)]:::fn --> V3[LayerNorm (64)]:::fn --> V4[FFN ReLU (64, D)]:::fn
+end
 
-    subgraph SAGE[SelfAttentionEncoder_e]
-        E1[Dense proj -> 64] --> E2[MHA heads 4 keydim 64] --> E3[LayerNorm] --> E4[FF Dense dim_hidden ReLU]
-    end
+subgraph ES[Encoder S]
+  direction LR
+  S1[Dense proj (F_s, 64)]:::fn --> S2[Self-attn 4h (64, 64)]:::fn --> S3[LayerNorm (64)]:::fn --> S4[FFN ReLU (64, D)]:::fn
+end
 
-    EncP --> P1
-    EncV --> V1
-    EncS --> S1
-    EncE --> E1
+subgraph EE[Encoder E]
+  direction LR
+  E1[Dense proj (F_e, 64)]:::fn --> E2[Self-attn 4h (64, 64)]:::fn --> E3[LayerNorm (64)]:::fn --> E4[FFN ReLU (64, D)]:::fn
+end
 
-    P4 --> Hp[h_p]
-    V4 --> Hv[h_v]
-    S4 --> Hs[h_s]
-    E4 --> He[h_e]
+%% Wire inputs into each encoder
+Xp --> P1
+Xv --> V1
+Xs --> S1
+Xe --> E1
 
-    Hp --> Stack[Stack nodes -> h_nodes]
-    Hv --> Stack
-    Hs --> Stack
-    He --> Stack
+%% Encoder outputs (objects)
+P4 --> Hp[h_p (B, D)]:::obj
+V4 --> Hv[h_v (B, D)]:::obj
+S4 --> Hs[h_s (B, D)]:::obj
+E4 --> He[h_e (B, D)]:::obj
 
-    subgraph ADJ[Learnable adjacency]
-        A0[A_logits 4x4] --> A1[sigmoid -> A_prob]
-        A1 --> A2[symmetrize]
-        A2 --> A3[zero diagonal]
-        A3 --> A4[broadcast -> adj_batch]
-    end
+%% Stack node embeddings
+Hp --> COL[Collect 4 (B, D)]:::aux
+Hv --> COL
+Hs --> COL
+He --> COL
+COL --> STK[Stack 4 nodes (B, 4, D)]:::fn --> HN[h_nodes (B, 4, D)]:::obj
 
-    Stack --> GAT0[GAT]
-    A4 --> GAT0
+%% Learnable adjacency (parameter path)
+subgraph ADJ[Learnable adjacency A]
+  direction LR
+  A0[A_logits (4, 4)]:::param --> A1[Sigmoid]:::fn --> A2[Symmetrize]:::fn --> A3[Zero diag]:::fn --> A4[Broadcast (B, 4, 4)]
+  A4:::fn
+end
 
-    subgraph GATB[GraphAttentionLayer]
-        G1[Linear Wh = hW] --> G2[Attention logits e_ij]
-        G2 --> G3[Mask with adj_batch]
-        G3 --> G4[Softmax]
-        G4 --> G5[Weighted sum -> h_gnn]
-    end
+%% Message passing + prediction head
+HN --> GAT[GAT layer (B, 4, D)]:::fn --> FLT[Flatten (B, 4D)]:::fn --> MLP[MLP head]:::fn --> OUT[y_hat (B, 1)]:::obj
+A4 -.-> GAT
 
-    GAT0 --> G1
-
-    G5 --> Flat[Flatten -> 4D]
-    Flat --> M1[Dropout]
-    M1 --> M2[Dense ff_dim ReLU]
-    M2 --> M3[Dropout]
-    M3 --> Out[Dense 1 -> y_hat]
+%% Styles
+classDef obj fill:#ffffff,stroke:#333,stroke-width:1px,color:#000;
+classDef fn fill:#e8f0ff,stroke:#2b4a9b,stroke-width:1px,color:#000;
+classDef param fill:#fff2df,stroke:#8a5a00,stroke-width:1px,color:#000;
+classDef aux fill:#ffffff,stroke:#999,stroke-width:1px,color:#000,stroke-dasharray:4 2;
 ```
