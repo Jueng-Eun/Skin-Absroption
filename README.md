@@ -1,63 +1,83 @@
 ```mermaid
-graph TD
-    Xp[x_p] --> EncP[Encoder_p]
-    Xv[x_v] --> EncV[Encoder_v]
-    Xs[x_s] --> EncS[Encoder_s]
-    Xe[x_e] --> EncE[Encoder_e]
+graph LR
 
-    subgraph SAGP[SelfAttentionEncoder_p]
-        P1[Dense proj -> 64] --> P2[MHA heads 4 keydim 64] --> P3[LayerNorm] --> P4[FF Dense dim_hidden ReLU]
-    end
+%% =========================
+%% Inputs
+%% =========================
+subgraph IN[Inputs]
+direction TB
+Xp[x_p] 
+Xv[x_v] 
+Xs[x_s] 
+Xe[x_e]
+end
 
-    subgraph SAGV[SelfAttentionEncoder_v]
-        V1[Dense proj -> 64] --> V2[MHA heads 4 keydim 64] --> V3[LayerNorm] --> V4[FF Dense dim_hidden ReLU]
-    end
+%% =========================
+%% Encoders
+%% =========================
+subgraph ENC[Type specific encoders]
+direction TB
 
-    subgraph SAGS[SelfAttentionEncoder_s]
-        S1[Dense proj -> 64] --> S2[MHA heads 4 keydim 64] --> S3[LayerNorm] --> S4[FF Dense dim_hidden ReLU]
-    end
+subgraph EP[Encoder p]
+direction LR
+EP1[Projection Dense] --> EP2[Multihead self attention] --> EP3[LayerNorm] --> EP4[Feedforward Dense ReLU]
+end
 
-    subgraph SAGE[SelfAttentionEncoder_e]
-        E1[Dense proj -> 64] --> E2[MHA heads 4 keydim 64] --> E3[LayerNorm] --> E4[FF Dense dim_hidden ReLU]
-    end
+subgraph EV[Encoder v]
+direction LR
+EV1[Projection Dense] --> EV2[Multihead self attention] --> EV3[LayerNorm] --> EV4[Feedforward Dense ReLU]
+end
 
-    EncP --> P1
-    EncV --> V1
-    EncS --> S1
-    EncE --> E1
+subgraph ES[Encoder s]
+direction LR
+ES1[Projection Dense] --> ES2[Multihead self attention] --> ES3[LayerNorm] --> ES4[Feedforward Dense ReLU]
+end
 
-    P4 --> Hp[h_p]
-    V4 --> Hv[h_v]
-    S4 --> Hs[h_s]
-    E4 --> He[h_e]
+subgraph EE[Encoder e]
+direction LR
+EE1[Projection Dense] --> EE2[Multihead self attention] --> EE3[LayerNorm] --> EE4[Feedforward Dense ReLU]
+end
 
-    Hp --> Stack[Stack nodes -> h_nodes]
-    Hv --> Stack
-    Hs --> Stack
-    He --> Stack
+end
 
-    subgraph ADJ[Learnable adjacency]
-        A0[A_logits 4x4] --> A1[sigmoid -> A_prob]
-        A1 --> A2[symmetrize]
-        A2 --> A3[zero diagonal]
-        A3 --> A4[broadcast -> adj_batch]
-    end
+Xp --> EP1
+Xv --> EV1
+Xs --> ES1
+Xe --> EE1
 
-    Stack --> GAT0[GAT]
-    A4 --> GAT0
+EP4 --> Hp[h_p]
+EV4 --> Hv[h_v]
+ES4 --> Hs[h_s]
+EE4 --> He[h_e]
 
-    subgraph GATB[GraphAttentionLayer]
-        G1[Linear Wh = hW] --> G2[Attention logits e_ij]
-        G2 --> G3[Mask with adj_batch]
-        G3 --> G4[Softmax]
-        G4 --> G5[Weighted sum -> h_gnn]
-    end
+%% =========================
+%% Graph construction
+%% =========================
+subgraph GRAPH[Heterogeneous graph construction]
+direction TB
+STACK[Stack node embeddings into 4 nodes] --> HN[h_nodes]
+ALOG[A logits trainable] --> AP[Sigmoid] --> AS[Symmetrize] --> AZ[Zero diagonal] --> AB[Broadcast to batch]
+end
 
-    GAT0 --> G1
+Hp --> STACK
+Hv --> STACK
+Hs --> STACK
+He --> STACK
 
-    G5 --> Flat[Flatten -> 4D]
-    Flat --> M1[Dropout]
-    M1 --> M2[Dense ff_dim ReLU]
-    M2 --> M3[Dropout]
-    M3 --> Out[Dense 1 -> y_hat]
+%% =========================
+%% GAT message passing
+%% =========================
+subgraph MP[Graph attention message passing]
+direction LR
+HN --> G0[GAT layer] --> HG[h_gnn]
+AB --> G0
+end
+
+%% =========================
+%% Predictor
+%% =========================
+subgraph PRED[Prediction head]
+direction LR
+HG --> FLAT[Flatten] --> D1[Dropout] --> FC[Dense ReLU] --> D2[Dropout] --> OUT[Dense 1 Output]
+end
 ```
