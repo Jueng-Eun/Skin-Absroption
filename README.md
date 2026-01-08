@@ -1,10 +1,9 @@
 ```mermaid
 flowchart TD
-  %% Inputs
-  Xp[x_p (B, num_p)] --> Ep
-  Xv[x_v (B, num_v)] --> Ev
-  Xs[x_s (B, num_s)] --> Es
-  Xe[x_e (B, num_e)] --> Ee
+    Xp[x_p] --> Ep[Encoder_p]
+    Xv[x_v] --> Ev[Encoder_v]
+    Xs[x_s] --> Es[Encoder_s]
+    Xe[x_e] --> Ee[Encoder_e]
 
   %% Encoders
   subgraph Ep[SelfAttentionEncoder_p]
