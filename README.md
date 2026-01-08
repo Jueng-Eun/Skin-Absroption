@@ -8,22 +8,22 @@ graph TD
 
   subgraph EP["Encoder P"]
     direction LR
-    P1["Dense (F_p, 64)"]:::fn --> P2["Attn (4h, 64)"]:::fn --> P3["LN (64)"]:::fn --> P4["Dense ReLU (64, D)"]:::fn
+    P1["Dense (F_p, 64)"]:::fn --> P2["Attn (4head, 64)"]:::fn --> P3["LN (64)"]:::fn --> P4["Dense ReLU (64, D)"]:::fn
   end
 
   subgraph EV["Encoder V"]
     direction LR
-    V1["Dense (F_v, 64)"]:::fn --> V2["Attn (4h, 64)"]:::fn --> V3["LN (64)"]:::fn --> V4["Dense ReLU (64, D)"]:::fn
+    V1["Dense (F_v, 64)"]:::fn --> V2["Attn (4head, 64)"]:::fn --> V3["LN (64)"]:::fn --> V4["Dense ReLU (64, D)"]:::fn
   end
 
   subgraph ES["Encoder S"]
     direction LR
-    S1["Dense (F_s, 64)"]:::fn --> S2["Attn (4h, 64)"]:::fn --> S3["LN (64)"]:::fn --> S4["Dense ReLU (64, D)"]:::fn
+    S1["Dense (F_s, 64)"]:::fn --> S2["Attn (4head, 64)"]:::fn --> S3["LN (64)"]:::fn --> S4["Dense ReLU (64, D)"]:::fn
   end
 
   subgraph EE["Encoder E"]
     direction LR
-    E1["Dense (F_e, 64)"]:::fn --> E2["Attn (4h, 64)"]:::fn --> E3["LN (64)"]:::fn --> E4["Dense ReLU (64, D)"]:::fn
+    E1["Dense (F_e, 64)"]:::fn --> E2["Attn (4head, 64)"]:::fn --> E3["LN (64)"]:::fn --> E4["Dense ReLU (64, D)"]:::fn
   end
 
   Xp --> P1
