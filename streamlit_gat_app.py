@@ -1,7 +1,7 @@
 """
 Dermal Absorption Rate(%) Prediction App (Streamlit)
 ----------------------------------------------------
-This Streamlit app loads a pre-trained HeteroGNN (Transformer -> GAT) model and
+This Streamlit app loads a pre-trained DermGAT model and
 predicts dermal absorption rate (%) under a reference active ingredient dose
 (100 µg/cm²). Users can (1) search a local chemical database Excel file to
 auto-fill physicochemical properties and (2) enter experiment/vehicle/skin
@@ -502,7 +502,7 @@ if "raw_defaults" not in st.session_state:
 if "cat_defaults" not in st.session_state:
     st.session_state.cat_defaults = {}
 
-st.title("🧪 HeteroGNN (Transformer→GAT) Dermal Absorption Prediction")
+st.title("DermGAT Dermal Absorption Prediction (Im et al., 2026)")
 
 st.markdown(
     """
