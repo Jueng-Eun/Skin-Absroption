@@ -216,6 +216,7 @@ SCALED_FEATURES = [
 
 NUMERIC_INPUTS = SCALED_FEATURES + [
     "Exposure Time",
+    "Skin Thickness",
     "Active Ingredient Content",
     "Vehicle Load",
     "Enhancer_ratio",
@@ -228,6 +229,13 @@ LABEL_MAPS = {
     "Corrosive_Irritation_score": {"Negative": 0, "Positive": 1},
     "Emulsifier": {"Not Include Emulsifier": 0, "Include Emulsifier": 1},
 }
+
+CATEGORICAL_INPUTS = [
+    "Skin Type",
+    "skin_site_code",
+    "Corrosive_Irritation_score",
+    "Emulsifier",
+]
 
 DEFAULT_LABELS = {
     "Skin Type": "human",
@@ -259,6 +267,7 @@ UNITS = {
     "Enhancer_vap": "Pa",
     "Appl_area": "cm2",
     "Exposure Time": "h",
+    "Skin Thickness": "um",
     "Active Ingredient Content": "%",
     "Init_Load_Area": "ug/cm2, calculated",
     "Vehicle Load": "ug, total formulation/vehicle amount",
@@ -359,6 +368,25 @@ def exposure_to_time_cat(exposure_time):
     return 3
 
 
+def skin_thickness_to_cat(thickness_um):
+    """
+    Convert actual skin thickness (um) to skin_thickness_cat.
+
+    Current app rule:
+      thin   = < 100 um
+      medium = 100 to < 1000 um
+      thick  = >= 1000 um
+
+    If the original training binning rule is different, update this function only.
+    """
+    thickness_um = float(thickness_um)
+    if thickness_um < 100:
+        return 0
+    if thickness_um < 1000:
+        return 1
+    return 2
+
+
 def calc_active_load_area(active_content_percent, vehicle_load, appl_area):
     """
     Active load per area:
@@ -386,6 +414,7 @@ def apply_training_transforms(raw):
     x["Water Solubility"] = np.round(np.log(float(x["Water Solubility"]) + 1e-5), 3)
     x["Vapor Pressure"] = np.round(np.log(float(x["Vapor Pressure"]) + 1e-5), 3)
     x["time"] = exposure_to_time_cat(x["Exposure Time"])
+    x["skin_thickness_cat"] = skin_thickness_to_cat(x["Skin Thickness"])
     x["Init_Load_Area"] = calc_active_load_area(
         active_content_percent=x["Active Ingredient Content"],
         vehicle_load=x["Vehicle Load"],
@@ -436,6 +465,33 @@ def scale_features(raw_model, scaler_params):
     return scaled
 
 
+def validate_inputs(raw):
+    errors = []
+
+    if float(raw.get("Appl_area", 0.0)) <= 0:
+        errors.append("Appl_area must be greater than 0 cm2.")
+
+    if float(raw.get("Vehicle Load", 0.0)) <= 0:
+        errors.append("Vehicle Load must be greater than 0 ug.")
+
+    if float(raw.get("Active Ingredient Content", 0.0)) < 0:
+        errors.append("Active Ingredient Content cannot be negative.")
+
+    if float(raw.get("Skin Thickness", 0.0)) <= 0:
+        errors.append("Skin Thickness must be greater than 0 um.")
+
+    if float(raw.get("Water Solubility", 0.0)) < 0:
+        errors.append("Water Solubility cannot be negative.")
+
+    if float(raw.get("Vapor Pressure", 0.0)) < 0:
+        errors.append("Vapor Pressure cannot be negative.")
+
+    if errors:
+        for msg in errors:
+            st.error(msg)
+        st.stop()
+
+
 def build_model_inputs(raw, cat, scaler_params, outlier_limits):
     raw_model = apply_training_transforms(raw)
     raw_model = clip_with_training_rule(raw_model, outlier_limits)
@@ -462,7 +518,7 @@ def build_model_inputs(raw, cat, scaler_params, outlier_limits):
 
     x_s = [
         float(cat["Skin Type"]),
-        float(cat["skin_thickness_cat"]),
+        float(raw_model["skin_thickness_cat"]),
         float(cat["skin_site_code"]),
     ]
 
@@ -501,6 +557,9 @@ Predicts **MM-converted dermal absorption (%)** at **100 ug/cm2** active ingredi
 
 The app calculates:
 `Init_Load_Area = Vehicle Load × Active Ingredient Content / 100 / Appl_area`
+
+It also calculates:
+`skin_thickness_cat` from actual skin thickness in um.
 
 Model: `2026_GAT_model_fold1_rev_v2.keras`
 """
@@ -581,9 +640,10 @@ if st.button("Search"):
 # -------------------------
 st.header("2) Inputs")
 st.caption(
-    "Enter active ingredient content (%), application area (cm2), and total vehicle/formulation dose (ug). "
-    "The app calculates active load per area and concentration automatically. "
-    "Water Solubility and Vapor Pressure are entered as raw values and log-transformed internally."
+    "Enter active ingredient content (%), application area (cm2), total vehicle/formulation dose (ug), "
+    "and actual skin thickness (um). The app calculates active load per area, concentration, "
+    "and skin_thickness_cat automatically. Water Solubility and Vapor Pressure are entered as raw values "
+    "and log-transformed internally."
 )
 
 with st.form("prediction_form"):
@@ -606,7 +666,8 @@ with st.form("prediction_form"):
 
     st.subheader("Categorical inputs")
 
-    for cat_name, mapping in LABEL_MAPS.items():
+    for cat_name in CATEGORICAL_INPUTS:
+        mapping = LABEL_MAPS[cat_name]
         choices = list(mapping.keys())
         default = st.session_state.cat_defaults.get(cat_name, DEFAULT_LABELS[cat_name])
         idx = choices.index(default) if default in choices else 0
@@ -614,164 +675,177 @@ with st.form("prediction_form"):
         selected = st.selectbox(cat_name, choices, index=idx)
         cat[cat_name] = int(mapping[selected])
 
-    submitted = st.form_submit_button("Predict")
+    submitted = st.form_submit_button("Predict", type="primary")
 
 
 # -------------------------
 # Prediction
 # -------------------------
 if submitted:
-    raw_model, x_p, x_v, x_s, x_e = build_model_inputs(raw, cat, scaler_params, outlier_limits)
+    validate_inputs(raw)
 
-    Xp = np.array([x_p], dtype=np.float32)
-    Xv = np.array([x_v], dtype=np.float32)
-    Xs = np.array([x_s], dtype=np.float32)
-    Xe = np.array([x_e], dtype=np.float32)
+    try:
+        with st.spinner("Running DermGAT prediction..."):
+            raw_model, x_p, x_v, x_s, x_e = build_model_inputs(raw, cat, scaler_params, outlier_limits)
 
-    y_log = float(model.predict([Xp, Xv, Xs, Xe], verbose=0).reshape(-1)[0])
-    y_log = max(y_log, 0.0)
-    y_abs = float(np.expm1(y_log))
+            Xp = np.array([x_p], dtype=np.float32)
+            Xv = np.array([x_v], dtype=np.float32)
+            Xs = np.array([x_s], dtype=np.float32)
+            Xe = np.array([x_e], dtype=np.float32)
 
-    st.header("Result")
-    st.metric("Predicted log(1 + Abs%)", f"{y_log:.4f}")
-    st.metric("Predicted MM-converted Absorption (%)", f"{y_abs:.4f}")
+            y_log = float(model.predict([Xp, Xv, Xs, Xe], verbose=0).reshape(-1)[0])
+            y_log = max(y_log, 0.0)
+            y_abs = float(np.expm1(y_log))
 
-    # =================================================
-    # 1) Input Summary
-    # =================================================
-    st.subheader("Input Summary")
+        st.success("Prediction completed.")
 
-    inv_skin_type = {v: k for k, v in LABEL_MAPS["Skin Type"].items()}
-    inv_skin_thickness = {v: k for k, v in LABEL_MAPS["skin_thickness_cat"].items()}
-    inv_skin_site = {v: k for k, v in LABEL_MAPS["skin_site_code"].items()}
-    inv_corrosive = {v: k for k, v in LABEL_MAPS["Corrosive_Irritation_score"].items()}
-    inv_emulsifier = {v: k for k, v in LABEL_MAPS["Emulsifier"].items()}
+        st.header("Result")
+        st.metric("Predicted log(1 + Abs%)", f"{y_log:.4f}")
+        st.metric("Predicted MM-converted Absorption (%)", f"{y_abs:.4f}")
 
-    summary_df = pd.DataFrame(
-        {
-            "Item": [
-                "Molecular Weight",
-                "LogKow",
-                "TPSA",
-                "Water Solubility, log-transformed",
-                "Vapor Pressure, log-transformed",
-                "Melting Point",
-                "Boiling Point",
-                "Density",
-                "Enhancer logKow",
-                "Enhancer vapor pressure",
-                "Enhancer ratio",
-                "Application area",
-                "Active ingredient content",
-                "Vehicle load",
-                "Calculated active load per area",
-                "Calculated concentration",
-                "Exposure time",
-                "Time category",
-                "Skin type",
-                "Skin thickness category",
-                "Skin site",
-                "Corrosive / irritation",
-                "Emulsifier",
-            ],
-            "Value": [
-                raw_model["Molecular Weight"],
-                raw_model["LogKow"],
-                raw_model["TPSA"],
-                raw_model["Water Solubility"],
-                raw_model["Vapor Pressure"],
-                raw_model["Melting Point"],
-                raw_model["Boiling Point"],
-                raw_model["Density"],
-                raw_model["Enhancer_logKow"],
-                raw_model["Enhancer_vap"],
-                raw_model["Enhancer_ratio"],
-                raw_model["Appl_area"],
-                raw_model["Active Ingredient Content"],
-                raw_model["Vehicle Load"],
-                raw_model["Init_Load_Area"],
-                raw_model["Conc"],
-                raw["Exposure Time"],
-                raw_model["time"],
-                inv_skin_type.get(cat["Skin Type"], cat["Skin Type"]),
-                inv_skin_thickness.get(cat["skin_thickness_cat"], cat["skin_thickness_cat"]),
-                inv_skin_site.get(cat["skin_site_code"], cat["skin_site_code"]),
-                inv_corrosive.get(cat["Corrosive_Irritation_score"], cat["Corrosive_Irritation_score"]),
-                inv_emulsifier.get(cat["Emulsifier"], cat["Emulsifier"]),
-            ],
-            "Unit / Encoding": [
-                "g/mol",
-                "-",
-                "A^2",
-                "log(mg/L + 1e-5)",
-                "log(mmHg + 1e-5)",
-                "deg C",
-                "deg C",
-                "g/mL",
-                "-",
-                "Pa",
-                "0-1",
-                "cm2",
-                "%",
-                "ug, total",
-                "ug/cm2",
-                "%",
-                "h",
-                "0: <=1 h, 1: <=12 h, 2: <=24 h, 3: >24 h",
-                "encoded category",
-                "encoded category",
-                "encoded category",
-                "encoded category",
-                "encoded category",
-            ],
-        }
-    )
+        # =================================================
+        # 1) Input Summary
+        # =================================================
+        st.subheader("Input Summary")
 
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        inv_skin_type = {v: k for k, v in LABEL_MAPS["Skin Type"].items()}
+        inv_skin_thickness = {v: k for k, v in LABEL_MAPS["skin_thickness_cat"].items()}
+        inv_skin_site = {v: k for k, v in LABEL_MAPS["skin_site_code"].items()}
+        inv_corrosive = {v: k for k, v in LABEL_MAPS["Corrosive_Irritation_score"].items()}
+        inv_emulsifier = {v: k for k, v in LABEL_MAPS["Emulsifier"].items()}
 
-    # =================================================
-    # 3) Dose Context
-    # =================================================
-    st.subheader("Dose Context")
-
-    input_dose = float(raw_model["Init_Load_Area"])
-    reference_dose = 100.0
-    dose_ratio = input_dose / reference_dose if reference_dose > 0 else np.nan
-
-    dose_df = pd.DataFrame(
-        {
-            "Dose": ["Input active load", "Model reference active load"],
-            "ug/cm2": [input_dose, reference_dose],
-        }
-    )
-
-    st.bar_chart(dose_df.set_index("Dose"))
-
-    st.write(
-        f"Input active load is **{dose_ratio:.2f}x** of the model reference dose "
-        f"(**100 ug/cm2**)."
-    )
-
-    if dose_ratio < 0.5 or dose_ratio > 2:
-        st.warning(
-            "The input active load is outside the 0.5x-2x range of the model reference dose. "
-            "Interpret the prediction carefully because the output is calibrated to "
-            "MM-converted absorption at 100 ug/cm2."
-        )
-    else:
-        st.success(
-            "The input active load is within the 0.5x-2x range of the model reference dose."
-        )
-
-    if show_debug:
-        st.subheader("Debug")
-        st.json(
+        summary_df = pd.DataFrame(
             {
-                "raw_after_preprocessing": raw_model,
-                "categorical_codes": cat,
-                "x_p_9": x_p,
-                "x_v_4": x_v,
-                "x_s_3": x_s,
-                "x_e_3": x_e,
+                "Item": [
+                    "Molecular Weight",
+                    "LogKow",
+                    "TPSA",
+                    "Water Solubility, log-transformed",
+                    "Vapor Pressure, log-transformed",
+                    "Melting Point",
+                    "Boiling Point",
+                    "Density",
+                    "Enhancer logKow",
+                    "Enhancer vapor pressure",
+                    "Enhancer ratio",
+                    "Application area",
+                    "Active ingredient content",
+                    "Vehicle load",
+                    "Calculated active load per area",
+                    "Calculated concentration",
+                    "Exposure time",
+                    "Time category",
+                    "Skin type",
+                    "Skin thickness, actual",
+                    "Skin thickness category, calculated",
+                    "Skin site",
+                    "Corrosive / irritation",
+                    "Emulsifier",
+                ],
+                "Value": [
+                    raw_model["Molecular Weight"],
+                    raw_model["LogKow"],
+                    raw_model["TPSA"],
+                    raw_model["Water Solubility"],
+                    raw_model["Vapor Pressure"],
+                    raw_model["Melting Point"],
+                    raw_model["Boiling Point"],
+                    raw_model["Density"],
+                    raw_model["Enhancer_logKow"],
+                    raw_model["Enhancer_vap"],
+                    raw_model["Enhancer_ratio"],
+                    raw_model["Appl_area"],
+                    raw_model["Active Ingredient Content"],
+                    raw_model["Vehicle Load"],
+                    raw_model["Init_Load_Area"],
+                    raw_model["Conc"],
+                    raw["Exposure Time"],
+                    raw_model["time"],
+                    inv_skin_type.get(cat["Skin Type"], cat["Skin Type"]),
+                    raw_model["Skin Thickness"],
+                    inv_skin_thickness.get(raw_model["skin_thickness_cat"], raw_model["skin_thickness_cat"]),
+                    inv_skin_site.get(cat["skin_site_code"], cat["skin_site_code"]),
+                    inv_corrosive.get(cat["Corrosive_Irritation_score"], cat["Corrosive_Irritation_score"]),
+                    inv_emulsifier.get(cat["Emulsifier"], cat["Emulsifier"]),
+                ],
+                "Unit / Encoding": [
+                    "g/mol",
+                    "-",
+                    "A^2",
+                    "log(mg/L + 1e-5)",
+                    "log(mmHg + 1e-5)",
+                    "deg C",
+                    "deg C",
+                    "g/mL",
+                    "-",
+                    "Pa",
+                    "0-1",
+                    "cm2",
+                    "%",
+                    "ug, total",
+                    "ug/cm2",
+                    "%",
+                    "h",
+                    "0: <=1 h, 1: <=12 h, 2: <=24 h, 3: >24 h",
+                    "encoded category",
+                    "um",
+                    "0: <100 um, 1: 100-<1000 um, 2: >=1000 um",
+                    "encoded category",
+                    "encoded category",
+                    "encoded category",
+                ],
             }
         )
+
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+        # =================================================
+        # 3) Dose Context
+        # =================================================
+        st.subheader("Dose Context")
+
+        input_dose = float(raw_model["Init_Load_Area"])
+        reference_dose = 100.0
+        dose_ratio = input_dose / reference_dose if reference_dose > 0 else np.nan
+
+        dose_df = pd.DataFrame(
+            {
+                "Dose": ["Input active load", "Model reference active load"],
+                "ug/cm2": [input_dose, reference_dose],
+            }
+        )
+
+        st.bar_chart(dose_df.set_index("Dose"))
+
+        st.write(
+            f"Input active load is **{dose_ratio:.2f}x** of the model reference dose "
+            f"(**100 ug/cm2**)."
+        )
+
+        if dose_ratio < 0.5 or dose_ratio > 2:
+            st.warning(
+                "The input active load is outside the 0.5x-2x range of the model reference dose. "
+                "Interpret the prediction carefully because the output is calibrated to "
+                "MM-converted absorption at 100 ug/cm2."
+            )
+        else:
+            st.success(
+                "The input active load is within the 0.5x-2x range of the model reference dose."
+            )
+
+        if show_debug:
+            st.subheader("Debug")
+            st.json(
+                {
+                    "raw_after_preprocessing": raw_model,
+                    "categorical_codes": {**cat, "skin_thickness_cat": int(raw_model["skin_thickness_cat"])},
+                    "x_p_9": x_p,
+                    "x_v_4": x_v,
+                    "x_s_3": x_s,
+                    "x_e_3": x_e,
+                }
+            )
+
+    except Exception as e:
+        st.error("Prediction failed. See the error details below.")
+        st.exception(e)
