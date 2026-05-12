@@ -817,6 +817,418 @@ def compute_local_shap(model, x_p, x_v, x_s, x_e):
         return None, f"SHAP calculation failed: {e}"
 
 
+def row_value(row, candidates, default=np.nan):
+    for col in candidates:
+        if col in row.index and pd.notna(row[col]):
+            return row[col]
+    return default
+
+
+def normalize_text_value(v):
+    if pd.isna(v):
+        return np.nan
+    return str(v).strip()
+
+
+def build_experimental_records_table(matched_rows, raw_model):
+    """
+    Show existing database experimental absorption results for the searched chemical
+    and compare key experimental variables to the current web-app condition.
+    """
+    if matched_rows is None or len(matched_rows) == 0:
+        return None
+
+    records = []
+
+    for _, row in matched_rows.iterrows():
+        observed_abs = row_value(row, ["DA_real", "Absorption", "Absorption (%)", "Dermal Absorption (%)"])
+        exp_conc = row_value(row, ["Conc", "Active Ingredient Content"])
+        exp_init_load = row_value(row, ["Init_Load_Area", "Active Load per Area"])
+        exp_vehicle = row_value(row, ["Vehicle Load"])
+        exp_appl_area = row_value(row, ["Appl_area", "Application area", "Application Area"])
+        exp_exposure = row_value(row, ["Exposure Time"])
+        exp_skin_thickness = row_value(row, ["Skin Thickness"])
+        exp_skin_type = row_value(row, ["Skin Type"])
+        exp_skin_site = row_value(row, ["skin_site", "skin_site_code"])
+        exp_emulsifier = row_value(row, ["Emulsifier"])
+        exp_enh_ratio = row_value(row, ["Enhancer_ratio"])
+        exp_enh_logkow = row_value(row, ["Enhancer_logKow"])
+        exp_enh_vap = row_value(row, ["Enhancer_vap"])
+
+        def diff_numeric(exp_val, current_val):
+            try:
+                if pd.isna(exp_val):
+                    return np.nan
+                return float(current_val) - float(exp_val)
+            except Exception:
+                return np.nan
+
+        records.append(
+            {
+                "name": row_value(row, ["name"], ""),
+                "cas": row_value(row, ["cas"], ""),
+                "Observed absorption, DA_real (%)": observed_abs,
+                "Current prediction condition Abs dose (ug/cm2)": raw_model["Init_Load_Area"],
+                "Experimental Init_Load_Area (ug/cm2)": exp_init_load,
+                "Diff Init_Load_Area": diff_numeric(exp_init_load, raw_model["Init_Load_Area"]),
+                "Current Active Ingredient Content / Conc (%)": raw_model["Conc"],
+                "Experimental Conc (%)": exp_conc,
+                "Diff Conc": diff_numeric(exp_conc, raw_model["Conc"]),
+                "Current Exposure Time (h)": raw_model["Exposure Time"],
+                "Experimental Exposure Time (h)": exp_exposure,
+                "Diff Exposure Time": diff_numeric(exp_exposure, raw_model["Exposure Time"]),
+                "Current Appl_area (cm2)": raw_model["Appl_area"],
+                "Experimental Appl_area (cm2)": exp_appl_area,
+                "Diff Appl_area": diff_numeric(exp_appl_area, raw_model["Appl_area"]),
+                "Current Vehicle Load (ug)": raw_model["Vehicle Load"],
+                "Experimental Vehicle Load (ug)": exp_vehicle,
+                "Diff Vehicle Load": diff_numeric(exp_vehicle, raw_model["Vehicle Load"]),
+                "Current Skin Thickness (um)": raw_model["Skin Thickness"],
+                "Experimental Skin Thickness (um)": exp_skin_thickness,
+                "Diff Skin Thickness": diff_numeric(exp_skin_thickness, raw_model["Skin Thickness"]),
+                "Experimental Skin Type": normalize_text_value(exp_skin_type),
+                "Experimental Skin Site": normalize_text_value(exp_skin_site),
+                "Experimental Emulsifier": exp_emulsifier,
+                "Current Enhancer_ratio": raw_model["Enhancer_ratio"],
+                "Experimental Enhancer_ratio": exp_enh_ratio,
+                "Diff Enhancer_ratio": diff_numeric(exp_enh_ratio, raw_model["Enhancer_ratio"]),
+                "Current Enhancer_logKow": raw_model["Enhancer_logKow"],
+                "Experimental Enhancer_logKow": exp_enh_logkow,
+                "Current Enhancer_vap (Pa)": raw_model["Enhancer_vap"],
+                "Experimental Enhancer_vap (Pa)": exp_enh_vap,
+            }
+        )
+
+    df = pd.DataFrame(records)
+
+    # Put the most relevant columns first and keep the table readable.
+    ordered_cols = [
+        "name",
+        "cas",
+        "Observed absorption, DA_real (%)",
+        "Current prediction condition Abs dose (ug/cm2)",
+        "Experimental Init_Load_Area (ug/cm2)",
+        "Diff Init_Load_Area",
+        "Current Active Ingredient Content / Conc (%)",
+        "Experimental Conc (%)",
+        "Diff Conc",
+        "Current Exposure Time (h)",
+        "Experimental Exposure Time (h)",
+        "Diff Exposure Time",
+        "Current Appl_area (cm2)",
+        "Experimental Appl_area (cm2)",
+        "Diff Appl_area",
+        "Current Vehicle Load (ug)",
+        "Experimental Vehicle Load (ug)",
+        "Diff Vehicle Load",
+        "Current Skin Thickness (um)",
+        "Experimental Skin Thickness (um)",
+        "Diff Skin Thickness",
+        "Experimental Skin Type",
+        "Experimental Skin Site",
+        "Current Enhancer_ratio",
+        "Experimental Enhancer_ratio",
+        "Diff Enhancer_ratio",
+        "Current Enhancer_logKow",
+        "Experimental Enhancer_logKow",
+        "Current Enhancer_vap (Pa)",
+        "Experimental Enhancer_vap (Pa)",
+        "Experimental Emulsifier",
+    ]
+
+    existing_cols = [c for c in ordered_cols if c in df.columns]
+    return df[existing_cols]
+
+
+def build_variable_difference_summary(exp_table):
+    if exp_table is None or exp_table.empty:
+        return None
+
+    diff_cols = [c for c in exp_table.columns if c.startswith("Diff ")]
+    rows = []
+
+    for col in diff_cols:
+        vals = pd.to_numeric(exp_table[col], errors="coerce").dropna()
+        if vals.empty:
+            continue
+
+        rows.append(
+            {
+                "Variable": col.replace("Diff ", ""),
+                "Mean absolute difference": float(vals.abs().mean()),
+                "Max absolute difference": float(vals.abs().max()),
+            }
+        )
+
+    if not rows:
+        return None
+
+    return pd.DataFrame(rows).sort_values("Mean absolute difference", ascending=False)
+
+
+def numeric_close(a, b, rel_tol=0.05, abs_tol=1e-6):
+    try:
+        if pd.isna(a) or pd.isna(b):
+            return True
+        a = float(a)
+        b = float(b)
+        return abs(a - b) <= max(abs_tol, rel_tol * max(abs(a), abs(b), 1.0))
+    except Exception:
+        return True
+
+
+def category_code_from_value(value, mapping):
+    if pd.isna(value):
+        return None
+
+    inverse = {v: k for k, v in mapping.items()}
+
+    if isinstance(value, str):
+        value_clean = value.strip()
+        if value_clean in mapping:
+            return int(mapping[value_clean])
+
+        value_lower = value_clean.lower()
+        for label, code in mapping.items():
+            if str(label).lower() == value_lower:
+                return int(code)
+
+        return None
+
+    try:
+        code = int(value)
+        if code in inverse:
+            return code
+    except Exception:
+        return None
+
+    return None
+
+
+def same_condition_except_dose(row, raw_model, cat):
+    """
+    Check whether a DB row is comparable to the current input condition,
+    excluding dose-related variables:
+      - Init_Load_Area
+      - Vehicle Load
+
+    Missing DB values are ignored. Available values must match approximately.
+    """
+    checks = []
+
+    # Numeric conditions
+    numeric_pairs = [
+        ("Conc", raw_model.get("Conc")),
+        ("Exposure Time", raw_model.get("Exposure Time")),
+        ("Appl_area", raw_model.get("Appl_area")),
+        ("Skin Thickness", raw_model.get("Skin Thickness")),
+        ("Enhancer_ratio", raw_model.get("Enhancer_ratio")),
+        ("Enhancer_logKow", raw_model.get("Enhancer_logKow")),
+        ("Enhancer_vap", raw_model.get("Enhancer_vap")),
+    ]
+
+    for col, current_value in numeric_pairs:
+        if col in row.index and pd.notna(row[col]):
+            checks.append(numeric_close(row[col], current_value))
+
+    # Skin Type
+    if "Skin Type" in row.index and pd.notna(row["Skin Type"]):
+        db_code = category_code_from_value(row["Skin Type"], LABEL_MAPS["Skin Type"])
+        if db_code is not None:
+            checks.append(db_code == int(cat["Skin Type"]))
+
+    # Skin site may be text in skin_site or encoded in skin_site_code
+    if "skin_site_code" in row.index and pd.notna(row["skin_site_code"]):
+        db_code = category_code_from_value(row["skin_site_code"], LABEL_MAPS["skin_site_code"])
+        if db_code is not None:
+            checks.append(db_code == int(cat["skin_site_code"]))
+    elif "skin_site" in row.index and pd.notna(row["skin_site"]):
+        db_code = category_code_from_value(row["skin_site"], LABEL_MAPS["skin_site_code"])
+        if db_code is not None:
+            checks.append(db_code == int(cat["skin_site_code"]))
+
+    # Emulsifier
+    if "Emulsifier" in row.index and pd.notna(row["Emulsifier"]):
+        db_code = category_code_from_value(row["Emulsifier"], LABEL_MAPS["Emulsifier"])
+        if db_code is not None:
+            checks.append(db_code == int(cat["Emulsifier"]))
+
+    if not checks:
+        return False
+
+    return all(checks)
+
+
+def build_same_condition_dose_df(matched_rows, raw_model, cat):
+    if matched_rows is None or len(matched_rows) == 0:
+        return pd.DataFrame()
+
+    records = []
+
+    for _, row in matched_rows.iterrows():
+        dose = row_value(row, ["Init_Load_Area", "Active Load per Area"])
+        obs = row_value(row, ["DA_real", "Absorption", "Absorption (%)", "Dermal Absorption (%)"])
+
+        if pd.isna(dose) or pd.isna(obs):
+            continue
+
+        if same_condition_except_dose(row, raw_model, cat):
+            records.append(
+                {
+                    "Dose (ug/cm2)": float(dose),
+                    "Absorption (%)": float(obs),
+                    "Series": "Experimental",
+                }
+            )
+
+    return pd.DataFrame(records)
+
+
+def fit_mm_curve_numpy(dose_values, response_values):
+    """
+    Fit a simple Michaelis-Menten-like curve:
+      y = Vmax * x / (Km + x)
+
+    This is only for visualization of dose-response trend when comparable
+    experimental records exist. It does not change the model prediction.
+    """
+    x = np.asarray(dose_values, dtype=float)
+    y = np.asarray(response_values, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y >= 0)
+    x = x[mask]
+    y = y[mask]
+
+    if len(x) < 2:
+        return pd.DataFrame()
+
+    x_min = max(float(np.min(x)) * 0.2, 1e-6)
+    x_max = max(float(np.max(x)) * 1.5, REFERENCE_ACTIVE_DOSE * 1.2)
+
+    km_grid = np.logspace(
+        np.log10(max(x_min, 1e-6)),
+        np.log10(max(x_max, x_min * 10)),
+        200,
+    )
+
+    best_sse = np.inf
+    best_vmax = None
+    best_km = None
+
+    for km in km_grid:
+        f = x / (km + x)
+        denom = np.sum(f * f)
+        if denom <= 0:
+            continue
+
+        vmax = np.sum(y * f) / denom
+        pred = vmax * f
+        sse = np.sum((y - pred) ** 2)
+
+        if sse < best_sse:
+            best_sse = sse
+            best_vmax = vmax
+            best_km = km
+
+    if best_vmax is None or best_km is None:
+        return pd.DataFrame()
+
+    x_line = np.linspace(0, x_max, 200)
+    y_line = best_vmax * x_line / (best_km + x_line + 1e-12)
+
+    return pd.DataFrame(
+        {
+            "Dose (ug/cm2)": x_line,
+            "Absorption (%)": y_line,
+            "Series": "MM fit",
+        }
+    )
+
+
+def show_mm_dose_comparison_if_applicable(matched_rows, raw_model, cat, y_abs):
+    exp_dose_df = build_same_condition_dose_df(matched_rows, raw_model, cat)
+
+    if exp_dose_df.empty:
+        return
+
+    st.subheader("Dose-response Comparison")
+
+    pred_df = pd.DataFrame(
+        {
+            "Dose (ug/cm2)": [float(raw_model["Init_Load_Area"])],
+            "Absorption (%)": [float(y_abs)],
+            "Series": ["Current prediction"],
+        }
+    )
+
+    point_df = pd.concat([exp_dose_df, pred_df], ignore_index=True)
+    mm_df = fit_mm_curve_numpy(
+        exp_dose_df["Dose (ug/cm2)"].values,
+        exp_dose_df["Absorption (%)"].values,
+    )
+
+    layers = [
+        {
+            "mark": {"type": "point", "filled": True, "size": 90},
+            "encoding": {
+                "x": {"field": "Dose (ug/cm2)", "type": "quantitative"},
+                "y": {"field": "Absorption (%)", "type": "quantitative"},
+                "color": {"field": "Series", "type": "nominal"},
+                "shape": {"field": "Series", "type": "nominal"},
+                "tooltip": [
+                    {"field": "Series", "type": "nominal"},
+                    {"field": "Dose (ug/cm2)", "type": "quantitative", "format": ".3f"},
+                    {"field": "Absorption (%)", "type": "quantitative", "format": ".3f"},
+                ],
+            },
+        }
+    ]
+
+    chart_data = point_df.copy()
+
+    if not mm_df.empty:
+        chart_data = pd.concat([point_df, mm_df], ignore_index=True)
+        layers.insert(
+            0,
+            {
+                "mark": {"type": "line"},
+                "transform": [{"filter": "datum.Series == 'MM fit'"}],
+                "encoding": {
+                    "x": {"field": "Dose (ug/cm2)", "type": "quantitative"},
+                    "y": {"field": "Absorption (%)", "type": "quantitative"},
+                    "color": {"field": "Series", "type": "nominal"},
+                    "tooltip": [
+                        {"field": "Series", "type": "nominal"},
+                        {"field": "Dose (ug/cm2)", "type": "quantitative", "format": ".3f"},
+                        {"field": "Absorption (%)", "type": "quantitative", "format": ".3f"},
+                    ],
+                },
+            },
+        )
+
+        # Keep point layer to only points.
+        layers[-1]["transform"] = [{"filter": "datum.Series != 'MM fit'"}]
+
+    st.vega_lite_chart(
+        chart_data,
+        {
+            "layer": layers,
+            "resolve": {"scale": {"color": "independent", "shape": "independent"}},
+            "height": 360,
+        },
+        use_container_width=True,
+    )
+
+    st.caption(
+        "This plot is shown only when existing database records match the current condition "
+        "except for dose-related variables. The MM curve is a visual fit to experimental "
+        "points and does not affect the model prediction."
+    )
+
+    with st.expander("Dose-response data"):
+        st.dataframe(point_df, use_container_width=True, hide_index=True)
+
+
 def label_for(feat):
     display_names = {
         "Water Solubility": "log_Water Solubility",
@@ -875,6 +1287,10 @@ if "raw_defaults" not in st.session_state:
     st.session_state.raw_defaults = {}
 if "cat_defaults" not in st.session_state:
     st.session_state.cat_defaults = {}
+if "matched_db_rows" not in st.session_state:
+    st.session_state.matched_db_rows = None
+if "matched_chemical_label" not in st.session_state:
+    st.session_state.matched_chemical_label = None
 
 show_debug = st.sidebar.checkbox("Show debug", value=False)
 
@@ -909,10 +1325,17 @@ if st.button("Search"):
 
         if hits.empty:
             st.warning("No match found.")
+            st.session_state.matched_db_rows = None
+            st.session_state.matched_chemical_label = None
         else:
             row = hits.iloc[0]
             st.success("Match found.")
             st.dataframe(hits.head(5))
+
+            st.session_state.matched_db_rows = hits.copy()
+            chem_name = str(row["name"]) if "name" in row.index else ""
+            chem_cas = str(row["cas"]) if "cas" in row.index else ""
+            st.session_state.matched_chemical_label = f"{chem_name} ({chem_cas})".strip()
 
             # Map Excel column names to internal model/scaler keys.
             # processed_test_target.xlsx uses log_* column names, while the scaler
@@ -1107,6 +1530,48 @@ if submitted:
         st.header("Result")
         st.metric("Predicted MM-converted Absorption (%)", f"{y_abs:.4f}")
         st.caption(f"Model output: log(1 + Abs%) = {y_log:.4f}")
+
+        # =================================================
+        # Existing experimental results for the searched chemical
+        # =================================================
+        matched_rows = st.session_state.get("matched_db_rows")
+
+        if matched_rows is not None and len(matched_rows) > 0:
+            st.subheader("Existing Experimental Results in Database")
+
+            label = st.session_state.get("matched_chemical_label")
+            if label:
+                st.caption(f"Matched chemical: {label}")
+
+            exp_table = build_experimental_records_table(matched_rows, raw_model)
+            diff_summary = build_variable_difference_summary(exp_table)
+
+            if exp_table is not None and not exp_table.empty:
+                observed_col = "Observed absorption, DA_real (%)"
+                observed_vals = pd.to_numeric(exp_table[observed_col], errors="coerce").dropna()
+
+                if len(observed_vals) > 0:
+                    c_obs1, c_obs2, c_obs3 = st.columns(3)
+                    c_obs1.metric("Observed n", str(len(observed_vals)))
+                    c_obs2.metric("Observed mean DA_real (%)", f"{observed_vals.mean():.3f}")
+                    c_obs3.metric("Observed range DA_real (%)", f"{observed_vals.min():.3f}–{observed_vals.max():.3f}")
+
+                with st.expander("Compare current input with existing experimental records", expanded=True):
+                    st.dataframe(exp_table, use_container_width=True, hide_index=True)
+
+                if diff_summary is not None:
+                    with st.expander("Which experimental variables differ most?"):
+                        st.dataframe(diff_summary, use_container_width=True, hide_index=True)
+
+                show_mm_dose_comparison_if_applicable(
+                    matched_rows,
+                    raw_model,
+                    cat,
+                    y_abs,
+                )
+            else:
+                st.info("No comparable experimental result columns were found for this chemical.")
+        # If no chemical was searched, skip the experimental DB comparison section.
 
         # =================================================
         # SHAP explanation for the current prediction
