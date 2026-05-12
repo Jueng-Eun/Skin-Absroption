@@ -341,6 +341,23 @@ def load_model_cached():
     )
 
 
+def normalize_scaler_feature_name(name):
+    name = str(name).strip()
+
+    if name.startswith("scaled_"):
+        name = name.replace("scaled_", "", 1)
+
+    alias = {
+        "Appl area": "Appl_area",
+        "Application area": "Appl_area",
+        "Application Area": "Appl_area",
+        "log_Water Solubility": "Water Solubility",
+        "log_Vapor Pressure": "Vapor Pressure",
+    }
+
+    return alias.get(name, name)
+
+
 @st.cache_resource
 def load_scaler_params():
     path = SCALER_PATH
@@ -358,8 +375,10 @@ def load_scaler_params():
     if path.endswith(".joblib") or path.endswith(".pkl"):
         bundle = joblib.load(path)
         scaler = bundle["scaler"]
-        cols = bundle["cols"]
-        return pd.DataFrame({"mean": scaler.mean_, "std": scaler.scale_}, index=cols)
+        cols = [normalize_scaler_feature_name(c) for c in bundle["cols"]]
+        df = pd.DataFrame({"mean": scaler.mean_, "std": scaler.scale_}, index=cols)
+        df = df[~df.index.duplicated(keep="first")]
+        return df[["mean", "std"]]
 
     with open(path, "rb") as f:
         content = f.read()
@@ -369,11 +388,54 @@ def load_scaler_params():
     if isinstance(obj, dict) and "schema" in obj and "data" in obj:
         df = pd.read_json(io.BytesIO(content), orient="table")
         if "feature" in df.columns:
+            df["feature"] = df["feature"].map(normalize_scaler_feature_name)
             df = df.set_index("feature")
+        elif df.index.name == "feature":
+            df.index = [normalize_scaler_feature_name(i) for i in df.index]
+        df = df[~df.index.duplicated(keep="first")]
         return df[["mean", "std"]]
 
-    rows = [{"feature": k, "mean": v["mean"], "std": v["std"]} for k, v in obj.items()]
-    return pd.DataFrame(rows).set_index("feature")[["mean", "std"]]
+    rows = []
+    for k, v in obj.items():
+        rows.append({
+            "feature": normalize_scaler_feature_name(k),
+            "mean": v["mean"],
+            "std": v["std"],
+        })
+    df = pd.DataFrame(rows).set_index("feature")
+    df = df[~df.index.duplicated(keep="first")]
+    return df[["mean", "std"]]
+
+
+def validate_scaler_params(scaler_params):
+    """
+    Validate scaler parameters that are always required.
+
+    Enhancer_logKow and Enhancer_vap are handled inside scale_features().
+    If Enhancer type is None, both raw values are 0 and the app uses scaled value 0
+    even when those scaler parameters are missing.
+    If an enhancer is selected, the app will require the corresponding scaler
+    parameters at prediction time.
+    """
+    required = [
+        "Molecular Weight",
+        "LogKow",
+        "TPSA",
+        "Water Solubility",
+        "Melting Point",
+        "Boiling Point",
+        "Vapor Pressure",
+        "Density",
+        "Appl_area",
+    ]
+
+    missing = [f for f in required if f not in scaler_params.index]
+
+    if missing:
+        st.error("Missing scaler parameter(s): " + ", ".join(missing))
+        with st.expander("Available scaler keys"):
+            st.write(list(scaler_params.index))
+        st.stop()
 
 
 @st.cache_data
@@ -529,18 +591,29 @@ def scale_features(raw_model, scaler_params):
     scaled = {}
 
     for feat in SCALED_FEATURES:
+        value = float(raw_model.get(feat, 0.0))
+        scaled_key = f"scaled_{feat}"
+
         if feat not in scaler_params.index:
+            # If no enhancer is selected, these are deliberately set to 0.
+            # Use neutral scaled value 0 so the app can predict without enhancer
+            # scaler parameters.
+            if feat in ["Enhancer_logKow", "Enhancer_vap"] and value == 0.0:
+                scaled[scaled_key] = 0.0
+                continue
+
             st.error(
                 f"Missing scaler parameter: {feat}. "
                 "Please check scaler_params.json."
             )
+            with st.expander("Available scaler keys"):
+                st.write(list(scaler_params.index))
             st.stop()
 
         mean = float(scaler_params.loc[feat, "mean"])
         std = float(scaler_params.loc[feat, "std"])
         std = std if std != 0 else 1e-9
-
-        scaled[f"scaled_{feat}"] = (float(raw_model[feat]) - mean) / std
+        scaled[scaled_key] = (value - mean) / std
 
     return scaled
 
@@ -657,7 +730,14 @@ Users can:
 )
 
 model = load_model_cached()
+
+if st.sidebar.button("Reload app files / clear cache"):
+    st.cache_resource.clear()
+    st.cache_data.clear()
+    st.rerun()
+
 scaler_params = load_scaler_params()
+validate_scaler_params(scaler_params)
 outlier_limits = load_outlier_limits()
 
 if "raw_defaults" not in st.session_state:
