@@ -570,7 +570,7 @@ UNITS = {
     "Molecular Weight": "g/mol",
     "LogKow": "-",
     "TPSA": "Å²",
-    "Water Solubility": "log(mol/L)",
+    "Water Solubility": "log(mg/L)",
     "Vapor Pressure": "log(mmHg)",
     "Melting Point": "°C",
     "Boiling Point": "°C",
