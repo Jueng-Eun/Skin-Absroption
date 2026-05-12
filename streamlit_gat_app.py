@@ -752,6 +752,87 @@ if st.button("Search"):
 st.header("2) Inputs")
 st.caption("Enter test conditions and chemical properties below.")
 
+# Keep enhancer widgets outside the form so the ratio/manual fields update immediately
+# when the user changes Enhancer type.
+st.subheader("Enhancer inputs")
+
+enhancer_choices = list(ENHANCER_PRESETS.keys())
+enhancer_default = st.session_state.cat_defaults.get("Enhancer type", "None")
+enhancer_default_idx = enhancer_choices.index(enhancer_default) if enhancer_default in enhancer_choices else 0
+
+enhancer_type = st.selectbox(
+    "Enhancer type",
+    enhancer_choices,
+    index=enhancer_default_idx,
+    help="Select the enhancer used in the vehicle/formulation.",
+)
+
+enhancer_raw = {}
+
+if enhancer_type == "None":
+    enhancer_raw["Enhancer_ratio"] = 0.0
+    enhancer_raw["Enhancer_logKow"] = 0.0
+    enhancer_raw["Enhancer_vap"] = 0.0
+    st.info("No enhancer selected.")
+
+elif enhancer_type == "Other":
+    default_ratio = float(st.session_state.raw_defaults.get("Enhancer_ratio", 1.0))
+    enhancer_raw["Enhancer_ratio"] = float(
+        st.number_input(
+            "Enhancer ratio (0-1)",
+            min_value=0.0,
+            max_value=1.0,
+            value=max(0.0, min(1.0, default_ratio)),
+            step=0.01,
+            format="%.4f",
+            key="enhancer_ratio_other",
+        )
+    )
+
+    c_enh1, c_enh2 = st.columns(2)
+    enhancer_raw["Enhancer_logKow"] = float(
+        c_enh1.number_input(
+            "Enhancer_logKow (-)",
+            value=float(st.session_state.raw_defaults.get("Enhancer_logKow", 0.0)),
+            step=0.01,
+            format="%.4f",
+            key="enhancer_logkow_other",
+        )
+    )
+    enhancer_raw["Enhancer_vap"] = float(
+        c_enh2.number_input(
+            "Enhancer_vap (Pa)",
+            value=float(st.session_state.raw_defaults.get("Enhancer_vap", 0.0)),
+            step=0.01,
+            format="%.4f",
+            key="enhancer_vap_other",
+        )
+    )
+
+else:
+    default_ratio = float(
+        st.session_state.raw_defaults.get(
+            "Enhancer_ratio",
+            ENHANCER_PRESETS[enhancer_type].get("Enhancer_ratio", 1.0),
+        )
+    )
+    enhancer_raw["Enhancer_ratio"] = float(
+        st.number_input(
+            "Enhancer ratio (0-1)",
+            min_value=0.0,
+            max_value=1.0,
+            value=max(0.0, min(1.0, default_ratio)),
+            step=0.01,
+            format="%.4f",
+            key="enhancer_ratio_preset",
+        )
+    )
+    enhancer_raw = apply_enhancer_settings(
+        enhancer_raw,
+        enhancer_type,
+        enhancer_raw["Enhancer_ratio"],
+    )
+
 with st.form("prediction_form"):
     raw = {}
     cat = {}
@@ -770,76 +851,8 @@ with st.form("prediction_form"):
             )
         )
 
-    st.subheader("Enhancer inputs")
-
-    enhancer_choices = list(ENHANCER_PRESETS.keys())
-    enhancer_default = st.session_state.cat_defaults.get("Enhancer type", "None")
-    enhancer_default_idx = enhancer_choices.index(enhancer_default) if enhancer_default in enhancer_choices else 0
-
-    enhancer_type = st.selectbox(
-        "Enhancer type",
-        enhancer_choices,
-        index=enhancer_default_idx,
-        help="Select the enhancer used in the vehicle/formulation.",
-    )
-
-    if enhancer_type == "None":
-        raw["Enhancer_ratio"] = 0.0
-        raw["Enhancer_logKow"] = 0.0
-        raw["Enhancer_vap"] = 0.0
-        st.info("No enhancer selected.")
-
-    elif enhancer_type == "Other":
-        default_ratio = float(st.session_state.raw_defaults.get("Enhancer_ratio", 1.0))
-        raw["Enhancer_ratio"] = float(
-            st.number_input(
-                "Enhancer ratio (0-1)",
-                min_value=0.0,
-                max_value=1.0,
-                value=max(0.0, min(1.0, default_ratio)),
-                step=0.01,
-                format="%.4f",
-            )
-        )
-
-        c_enh1, c_enh2 = st.columns(2)
-        raw["Enhancer_logKow"] = float(
-            c_enh1.number_input(
-                "Enhancer_logKow (-)",
-                value=float(st.session_state.raw_defaults.get("Enhancer_logKow", 0.0)),
-                step=0.01,
-                format="%.4f",
-            )
-        )
-        raw["Enhancer_vap"] = float(
-            c_enh2.number_input(
-                "Enhancer_vap (Pa)",
-                value=float(st.session_state.raw_defaults.get("Enhancer_vap", 0.0)),
-                step=0.01,
-                format="%.4f",
-            )
-        )
-
-
-    else:
-        default_ratio = float(
-            st.session_state.raw_defaults.get(
-                "Enhancer_ratio",
-                ENHANCER_PRESETS[enhancer_type].get("Enhancer_ratio", 1.0),
-            )
-        )
-        raw["Enhancer_ratio"] = float(
-            st.number_input(
-                "Enhancer ratio (0-1)",
-                min_value=0.0,
-                max_value=1.0,
-                value=max(0.0, min(1.0, default_ratio)),
-                step=0.01,
-                format="%.4f",
-            )
-        )
-        raw = apply_enhancer_settings(raw, enhancer_type, raw["Enhancer_ratio"])
-
+    # Add enhancer values selected above to model input raw dictionary.
+    raw.update(enhancer_raw)
 
     st.subheader("Categorical inputs")
 
