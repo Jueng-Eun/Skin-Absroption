@@ -830,6 +830,46 @@ def normalize_text_value(v):
     return str(v).strip()
 
 
+def get_reference_value(row):
+    """
+    Currently unused because processed_test_target.xlsx does not contain
+    reference/source information.
+
+    If Reference/DOI/PMID columns are added later, uncomment the Reference field
+    in build_experimental_records_table() and ordered_cols.
+    """
+    ref_candidates = [
+        "Reference",
+        "reference",
+        "Ref",
+        "ref",
+        "Source",
+        "source",
+        "Citation",
+        "citation",
+        "Literature",
+        "literature",
+        "Study",
+        "study",
+        "Title",
+        "title",
+        "Paper",
+        "paper",
+        "DOI",
+        "doi",
+        "PMID",
+        "pmid",
+    ]
+
+    for col in ref_candidates:
+        if col in row.index and pd.notna(row[col]):
+            val = str(row[col]).strip()
+            if val:
+                return val
+
+    return "NA"
+
+
 def build_experimental_records_table(matched_rows, raw_model):
     """
     Show existing database experimental absorption results for the searched chemical
@@ -867,6 +907,8 @@ def build_experimental_records_table(matched_rows, raw_model):
             {
                 "name": row_value(row, ["name"], ""),
                 "cas": row_value(row, ["cas"], ""),
+                # Reference is currently not available in processed_test_target.xlsx.
+                # "Reference": get_reference_value(row),
                 "Observed absorption, DA_real (%)": observed_abs,
                 "Current prediction condition Abs dose (ug/cm2)": raw_model["Init_Load_Area"],
                 "Experimental Init_Load_Area (ug/cm2)": exp_init_load,
@@ -905,6 +947,7 @@ def build_experimental_records_table(matched_rows, raw_model):
     ordered_cols = [
         "name",
         "cas",
+        # "Reference",  # currently not available in processed_test_target.xlsx
         "Observed absorption, DA_real (%)",
         "Current prediction condition Abs dose (ug/cm2)",
         "Experimental Init_Load_Area (ug/cm2)",
@@ -1534,44 +1577,9 @@ if submitted:
         # =================================================
         # Existing experimental results for the searched chemical
         # =================================================
-        matched_rows = st.session_state.get("matched_db_rows")
-
-        if matched_rows is not None and len(matched_rows) > 0:
-            st.subheader("Existing Experimental Results in Database")
-
-            label = st.session_state.get("matched_chemical_label")
-            if label:
-                st.caption(f"Matched chemical: {label}")
-
-            exp_table = build_experimental_records_table(matched_rows, raw_model)
-            diff_summary = build_variable_difference_summary(exp_table)
-
-            if exp_table is not None and not exp_table.empty:
-                observed_col = "Observed absorption, DA_real (%)"
-                observed_vals = pd.to_numeric(exp_table[observed_col], errors="coerce").dropna()
-
-                if len(observed_vals) > 0:
-                    c_obs1, c_obs2, c_obs3 = st.columns(3)
-                    c_obs1.metric("Observed n", str(len(observed_vals)))
-                    c_obs2.metric("Observed mean DA_real (%)", f"{observed_vals.mean():.3f}")
-                    c_obs3.metric("Observed range DA_real (%)", f"{observed_vals.min():.3f}–{observed_vals.max():.3f}")
-
-                with st.expander("Compare current input with existing experimental records", expanded=True):
-                    st.dataframe(exp_table, use_container_width=True, hide_index=True)
-
-                if diff_summary is not None:
-                    with st.expander("Which experimental variables differ most?"):
-                        st.dataframe(diff_summary, use_container_width=True, hide_index=True)
-
-                show_mm_dose_comparison_if_applicable(
-                    matched_rows,
-                    raw_model,
-                    cat,
-                    y_abs,
-                )
-            else:
-                st.info("No comparable experimental result columns were found for this chemical.")
-        # If no chemical was searched, skip the experimental DB comparison section.
+        # This section is currently disabled.
+        # To re-enable it later, restore the commented experimental DB comparison block
+        # from a previous version of this app.
 
         # =================================================
         # SHAP explanation for the current prediction
