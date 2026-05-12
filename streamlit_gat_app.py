@@ -725,151 +725,96 @@ def predict_single(model, raw, cat, scaler_params, outlier_limits):
     return y_log, y_abs, raw_model, x_p, x_v, x_s, x_e
 
 
-def compute_data_reliability(raw_model, scaler_params):
+def flatten_model_inputs(x_p, x_v, x_s, x_e):
+    return np.array(x_p + x_v + x_s + x_e, dtype=np.float32)
+
+
+FLAT_FEATURE_NAMES = [
+    "Molecular Weight",
+    "LogKow",
+    "TPSA",
+    "log_Water Solubility",
+    "Melting Point",
+    "Boiling Point",
+    "log_Vapor Pressure",
+    "Density",
+    "Corrosive_Irritation_score",
+    "Emulsifier",
+    "Enhancer_logKow",
+    "Enhancer_vap",
+    "Enhancer_ratio",
+    "Skin Type",
+    "skin_thickness_cat",
+    "skin_site_code",
+    "Conc",
+    "Appl_area",
+    "time",
+]
+
+
+def predict_from_flat(model, z):
+    z = np.asarray(z, dtype=np.float32)
+
+    if z.ndim == 1:
+        z = z.reshape(1, -1)
+
+    Xp = z[:, 0:9]
+    Xv = z[:, 9:13]
+    Xs = z[:, 13:16]
+    Xe = z[:, 16:19]
+
+    return model.predict([Xp, Xv, Xs, Xe], verbose=0).reshape(-1)
+
+
+def compute_local_shap(model, x_p, x_v, x_s, x_e):
     """
-    Numeric data reliability score based on how close the input condition is to
-    the training distribution represented by scaler mean/std.
+    Compute local SHAP values for the current prediction using KernelExplainer.
 
-    This is not a true prediction confidence interval. It is a data-similarity
-    reliability score for new/unseen inputs.
+    Output SHAP values are on the model output scale: log(1 + Abs%).
+    Background is a neutral zero vector:
+      - scaled numeric features = training mean
+      - binary/ratio/category fields = 0 reference
     """
-    checked_features = [
-        "Molecular Weight",
-        "LogKow",
-        "TPSA",
-        "Water Solubility",
-        "Melting Point",
-        "Boiling Point",
-        "Vapor Pressure",
-        "Density",
-        "Enhancer_logKow",
-        "Enhancer_vap",
-        "Appl_area",
-    ]
+    try:
+        import shap
+    except Exception as e:
+        return None, (
+            "SHAP is not installed. Add `shap` to requirements.txt, then redeploy. "
+            f"Original import error: {e}"
+        )
 
-    rows = []
+    x_flat = flatten_model_inputs(x_p, x_v, x_s, x_e).reshape(1, -1)
+    background = np.zeros_like(x_flat, dtype=np.float32)
 
-    for feat in checked_features:
-        if feat not in scaler_params.index:
-            continue
+    try:
+        explainer = shap.KernelExplainer(
+            lambda z: predict_from_flat(model, z),
+            background,
+        )
 
-        mean = float(scaler_params.loc[feat, "mean"])
-        std = float(scaler_params.loc[feat, "std"])
-        std = std if std != 0 else 1e-9
+        shap_values = explainer.shap_values(
+            x_flat,
+            nsamples=min(100, 2 * x_flat.shape[1] + 1),
+        )
 
-        value = float(raw_model.get(feat, 0.0))
-        z = (value - mean) / std
-        abs_z = abs(z)
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
 
-        if abs_z <= 2:
-            feature_score = 100.0
-            status = "Typical"
-        elif abs_z <= 3:
-            feature_score = 100.0 - 40.0 * (abs_z - 2.0)
-            status = "Boundary"
-        else:
-            feature_score = max(0.0, 60.0 - 20.0 * (abs_z - 3.0))
-            status = "Outside"
+        shap_values = np.asarray(shap_values).reshape(-1)
 
-        rows.append(
+        shap_df = pd.DataFrame(
             {
-                "Feature": feat,
-                "Input value": value,
-                "Training mean": mean,
-                "Training std": std,
-                "Abs z-score": abs_z,
-                "Feature reliability": feature_score,
-                "Status": status,
+                "Feature": FLAT_FEATURE_NAMES,
+                "SHAP value": shap_values,
+                "Abs SHAP": np.abs(shap_values),
+                "Direction": np.where(shap_values >= 0, "Increases prediction", "Decreases prediction"),
             }
-        )
+        ).sort_values("Abs SHAP", ascending=False)
 
-    reliability_df = pd.DataFrame(rows)
+        return shap_df, None
 
-    if reliability_df.empty:
-        return 0.0, "Unknown", "Reliability could not be calculated.", reliability_df
-
-    score = float(reliability_df["Feature reliability"].mean())
-    max_z = float(reliability_df["Abs z-score"].max())
-    n_outside = int((reliability_df["Status"] == "Outside").sum())
-
-    if score >= 80:
-        level = "High"
-    elif score >= 60:
-        level = "Moderate"
-    else:
-        level = "Low"
-
-    message = (
-        f"{score:.1f}/100 ({level}) | max |z| = {max_z:.2f}, "
-        f"outside features = {n_outside}"
-    )
-
-    return score, level, message, reliability_df
-
-
-def make_sensitivity_values(option, raw):
-    current = float(raw.get(option, 0.0))
-
-    if option == "Exposure Time":
-        return np.array([0.5, 1, 3, 6, 12, 24, 48], dtype=float)
-
-    if option == "Active Ingredient Content":
-        current = max(float(raw.get("Active Ingredient Content", 1.0)), 0.1)
-        upper = min(100.0, max(10.0, current * 5.0))
-        lower = max(0.1, min(current * 0.2, upper))
-        return np.linspace(lower, upper, 20)
-
-    if option == "Skin Thickness":
-        return np.array([50, 100, 200, 500, 1000, 2000, 3000], dtype=float)
-
-    if option == "Enhancer_ratio":
-        return np.linspace(0.0, 1.0, 21)
-
-    return np.array([], dtype=float)
-
-
-def build_sensitivity_df(
-    option,
-    raw,
-    cat,
-    model,
-    scaler_params,
-    outlier_limits,
-    enhancer_type,
-):
-    if option == "Enhancer_ratio" and enhancer_type == "None":
-        return pd.DataFrame()
-
-    values = make_sensitivity_values(option, raw)
-    records = []
-
-    for v in values:
-        raw_i = raw.copy()
-
-        if option == "Enhancer_ratio":
-            raw_i["Enhancer_ratio"] = float(v)
-        else:
-            raw_i[option] = float(v)
-
-        y_log_i, y_abs_i, raw_model_i, *_ = predict_single(
-            model,
-            raw_i,
-            cat,
-            scaler_params,
-            outlier_limits,
-        )
-
-        records.append(
-            {
-                option: float(v),
-                "Predicted MM-converted Absorption (%)": y_abs_i,
-                "Predicted log(1 + Abs%)": y_log_i,
-                "Calculated Vehicle Load (ug)": raw_model_i["Vehicle Load"],
-                "skin_thickness_cat": raw_model_i.get("skin_thickness_cat"),
-            }
-        )
-
-    return pd.DataFrame(records)
+    except Exception as e:
+        return None, f"SHAP calculation failed: {e}"
 
 
 def label_for(feat):
@@ -1025,17 +970,6 @@ st.caption(
     "Vehicle/Formulation dose is calculated automatically for 100 µg/cm² active dose."
 )
 
-sensitivity_option = st.selectbox(
-    "Sensitivity plot",
-    [
-        "Exposure Time",
-        "Active Ingredient Content",
-        "Skin Thickness",
-        "Enhancer_ratio",
-    ],
-    index=0,
-)
-
 # Keep enhancer widgets outside the form so the ratio/manual fields update immediately
 # when the user changes Enhancer type.
 st.subheader("Enhancer inputs")
@@ -1171,205 +1105,42 @@ if submitted:
         st.success("Prediction completed.")
 
         st.header("Result")
-
-        reliability_score, reliability_level, reliability_message, reliability_df = compute_data_reliability(
-            raw_model,
-            scaler_params,
-        )
-
-        result_col1, result_col2 = st.columns(2)
-        result_col1.metric("Predicted MM-converted Absorption (%)", f"{y_abs:.4f}")
-        result_col2.metric("Data Reliability", f"{reliability_score:.1f}/100", reliability_level)
-
+        st.metric("Predicted MM-converted Absorption (%)", f"{y_abs:.4f}")
         st.caption(f"Model output: log(1 + Abs%) = {y_log:.4f}")
 
-        if reliability_level == "High":
-            st.success(reliability_message)
-        elif reliability_level == "Moderate":
-            st.warning(reliability_message)
-        else:
-            st.error(reliability_message)
-
         # =================================================
-        # 1) Input Summary
+        # SHAP explanation for the current prediction
         # =================================================
-        st.subheader("Input Summary")
+        st.subheader("SHAP Feature Importance")
 
-        inv_skin_type = {v: k for k, v in LABEL_MAPS["Skin Type"].items()}
-        inv_skin_thickness = {v: k for k, v in LABEL_MAPS["skin_thickness_cat"].items()}
-        inv_skin_site = {v: k for k, v in LABEL_MAPS["skin_site_code"].items()}
-        inv_corrosive = {v: k for k, v in LABEL_MAPS["Corrosive_Irritation_score"].items()}
-        inv_emulsifier = {v: k for k, v in LABEL_MAPS["Emulsifier"].items()}
-
-        summary_df = pd.DataFrame(
-            {
-                "Item": [
-                    "Molecular Weight",
-                    "LogKow",
-                    "TPSA",
-                    "log_Water Solubility",
-                    "log_Vapor Pressure",
-                    "Melting Point",
-                    "Boiling Point",
-                    "Density",
-                    "Enhancer logKow",
-                    "Enhancer vapor pressure",
-                    "Enhancer type",
-                    "Enhancer ratio",
-                    "Enhancer logKow, auto-filled",
-                    "Enhancer vapor pressure, auto-filled",
-                    "Application area",
-                    "Active ingredient content",
-                    "Calculated vehicle/formulation dose",
-                    "Reference active load per area",
-                    "Calculated concentration",
-                    "Exposure time",
-                    "Time category",
-                    "Skin type",
-                    "Skin thickness, actual",
-                    "Skin thickness category, calculated",
-                    "Skin site",
-                    "Corrosive / irritation",
-                    "Emulsifier",
-                ],
-                "Value": [
-                    raw_model["Molecular Weight"],
-                    raw_model["LogKow"],
-                    raw_model["TPSA"],
-                    raw_model["Water Solubility"],
-                    raw_model["Vapor Pressure"],
-                    raw_model["Melting Point"],
-                    raw_model["Boiling Point"],
-                    raw_model["Density"],
-                    raw_model["Enhancer_logKow"],
-                    raw_model["Enhancer_vap"],
-                    enhancer_type,
-                    raw_model["Enhancer_ratio"],
-                    raw_model["Enhancer_logKow"],
-                    raw_model["Enhancer_vap"],
-                    raw_model["Appl_area"],
-                    raw_model["Active Ingredient Content"],
-                    raw_model["Vehicle Load"],
-                    raw_model["Init_Load_Area"],
-                    raw_model["Conc"],
-                    raw["Exposure Time"],
-                    raw_model["time"],
-                    inv_skin_type.get(cat["Skin Type"], cat["Skin Type"]),
-                    raw_model["Skin Thickness"],
-                    inv_skin_thickness.get(raw_model["skin_thickness_cat"], raw_model["skin_thickness_cat"]),
-                    inv_skin_site.get(cat["skin_site_code"], cat["skin_site_code"]),
-                    inv_corrosive.get(cat["Corrosive_Irritation_score"], cat["Corrosive_Irritation_score"]),
-                    inv_emulsifier.get(cat["Emulsifier"], cat["Emulsifier"]),
-                ],
-                "Unit / Encoding": [
-                    "g/mol",
-                    "-",
-                    "A^2",
-                    "log(mg/L + 1e-5), input value",
-                    "log(mmHg + 1e-5), input value",
-                    "deg C",
-                    "deg C",
-                    "g/mL",
-                    "-",
-                    "Pa",
-                    "selected",
-                    "0-1",
-                    "-",
-                    "Pa",
-                    "cm2",
-                    "%",
-                    "ug, calculated total",
-                    "ug/cm2",
-                    "%",
-                    "h",
-                    "0: <=1 h, 1: <=12 h, 2: <=24 h, 3: >24 h",
-                    "encoded category",
-                    "um",
-                    "0: <100 um, 1: 100-<1000 um, 2: >=1000 um",
-                    "encoded category",
-                    "encoded category",
-                    "encoded category",
-                ],
-            }
-        )
-
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-        # =================================================
-        # Prediction Condition Summary
-        # =================================================
-        st.subheader("Prediction Condition Summary")
-
-        condition_df = pd.DataFrame(
-            {
-                "Condition": [
-                    "Reference active dose",
-                    "Calculated vehicle/formulation dose",
-                    "Application area",
-                    "Active ingredient content",
-                    "Exposure time",
-                    "Skin thickness category",
-                    "Enhancer type",
-                ],
-                "Value": [
-                    f"{REFERENCE_ACTIVE_DOSE:.1f}",
-                    f"{raw_model['Vehicle Load']:.4f}",
-                    f"{raw_model['Appl_area']:.4f}",
-                    f"{raw_model['Active Ingredient Content']:.4f}",
-                    f"{raw_model['Exposure Time']:.4f}",
-                    f"{int(raw_model['skin_thickness_cat'])}",
-                    enhancer_type,
-                ],
-                "Unit": [
-                    "ug/cm2",
-                    "ug",
-                    "cm2",
-                    "%",
-                    "h",
-                    "0: thin, 1: medium, 2: thick",
-                    "-",
-                ],
-            }
-        )
-
-        st.dataframe(condition_df, use_container_width=True, hide_index=True)
-
-        # =================================================
-        # Data Reliability details
-        # =================================================
-        with st.expander("Data Reliability details"):
-            st.dataframe(
-                reliability_df.sort_values("Abs z-score", ascending=False),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        # =================================================
-        # Sensitivity Plot
-        # =================================================
-        st.subheader("Sensitivity Plot")
-
-        sensitivity_df = build_sensitivity_df(
-            sensitivity_option,
-            raw,
-            cat,
+        shap_df, shap_error = compute_local_shap(
             model,
-            scaler_params,
-            outlier_limits,
-            enhancer_type,
+            x_p,
+            x_v,
+            x_s,
+            x_e,
         )
 
-        if sensitivity_df.empty:
-            st.info("Select an enhancer other than None to view Enhancer_ratio sensitivity.")
+        if shap_error is not None:
+            st.warning(shap_error)
         else:
-            st.line_chart(
-                sensitivity_df.set_index(sensitivity_option)[
-                    "Predicted MM-converted Absorption (%)"
-                ]
+            st.caption(
+                "SHAP values are shown on the model output scale, log(1 + Abs%). "
+                "Positive values increase the prediction; negative values decrease it."
             )
 
-            with st.expander("Sensitivity data"):
-                st.dataframe(sensitivity_df, use_container_width=True, hide_index=True)
+            top_shap_df = shap_df.head(12).copy()
+
+            st.bar_chart(
+                top_shap_df.set_index("Feature")["SHAP value"]
+            )
+
+            with st.expander("SHAP values table"):
+                st.dataframe(
+                    shap_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         if show_debug:
             st.subheader("Debug")
