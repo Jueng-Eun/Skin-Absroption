@@ -216,7 +216,7 @@ SCALED_FEATURES = [
 
 NUMERIC_INPUTS = SCALED_FEATURES + [
     "Exposure Time",
-    "Init_Load_Area",
+    "Active Ingredient Content",
     "Vehicle Load",
     "Enhancer_ratio",
 ]
@@ -259,8 +259,9 @@ UNITS = {
     "Enhancer_vap": "Pa",
     "Appl_area": "cm2",
     "Exposure Time": "h",
-    "Init_Load_Area": "ug/cm2",
-    "Vehicle Load": "ug",
+    "Active Ingredient Content": "%",
+    "Init_Load_Area": "ug/cm2, calculated",
+    "Vehicle Load": "ug, total formulation/vehicle amount",
     "Enhancer_ratio": "0-1",
 }
 
@@ -358,10 +359,25 @@ def exposure_to_time_cat(exposure_time):
     return 3
 
 
-def calc_conc(init_load_area, appl_area, vehicle_load):
-    active_load = float(init_load_area) * float(appl_area)
-    vehicle_load = max(float(vehicle_load), 1e-9)
-    return active_load / vehicle_load * 100.0
+def calc_active_load_area(active_content_percent, vehicle_load, appl_area):
+    """
+    Active load per area:
+      active_load_total = vehicle_load * active_content_percent / 100
+      Init_Load_Area = active_load_total / appl_area
+    """
+    active_load_total = float(vehicle_load) * float(active_content_percent) / 100.0
+    appl_area = max(float(appl_area), 1e-9)
+    return active_load_total / appl_area
+
+
+def calc_conc(active_content_percent):
+    """
+    Training definition:
+      Conc = Active Load / Vehicle Load * 100
+
+    If the user enters active ingredient content (%), Conc is equal to that value.
+    """
+    return float(active_content_percent)
 
 
 def apply_training_transforms(raw):
@@ -370,7 +386,12 @@ def apply_training_transforms(raw):
     x["Water Solubility"] = np.round(np.log(float(x["Water Solubility"]) + 1e-5), 3)
     x["Vapor Pressure"] = np.round(np.log(float(x["Vapor Pressure"]) + 1e-5), 3)
     x["time"] = exposure_to_time_cat(x["Exposure Time"])
-    x["Conc"] = calc_conc(x["Init_Load_Area"], x["Appl_area"], x["Vehicle Load"])
+    x["Init_Load_Area"] = calc_active_load_area(
+        active_content_percent=x["Active Ingredient Content"],
+        vehicle_load=x["Vehicle Load"],
+        appl_area=x["Appl_area"],
+    )
+    x["Conc"] = calc_conc(x["Active Ingredient Content"])
 
     return x
 
@@ -478,6 +499,9 @@ st.markdown(
     """
 Predicts **MM-converted dermal absorption (%)** at **100 ug/cm2** active ingredient dose.
 
+The app calculates:
+`Init_Load_Area = Vehicle Load × Active Ingredient Content / 100 / Appl_area`
+
 Model: `2026_GAT_model_fold1_rev_v2.keras`
 """
 )
@@ -556,7 +580,11 @@ if st.button("Search"):
 # Inputs
 # -------------------------
 st.header("2) Inputs")
-st.caption("Enter raw Water Solubility and Vapor Pressure. The app applies log(x + 1e-5) internally.")
+st.caption(
+    "Enter active ingredient content (%), application area (cm2), and total vehicle/formulation dose (ug). "
+    "The app calculates active load per area and concentration automatically. "
+    "Water Solubility and Vapor Pressure are entered as raw values and log-transformed internally."
+)
 
 with st.form("prediction_form"):
     raw = {}
@@ -634,8 +662,9 @@ if submitted:
                 "Enhancer vapor pressure",
                 "Enhancer ratio",
                 "Application area",
-                "Input active load per area",
+                "Active ingredient content",
                 "Vehicle load",
+                "Calculated active load per area",
                 "Calculated concentration",
                 "Exposure time",
                 "Time category",
@@ -658,8 +687,9 @@ if submitted:
                 raw_model["Enhancer_vap"],
                 raw_model["Enhancer_ratio"],
                 raw_model["Appl_area"],
-                raw_model["Init_Load_Area"],
+                raw_model["Active Ingredient Content"],
                 raw_model["Vehicle Load"],
+                raw_model["Init_Load_Area"],
                 raw_model["Conc"],
                 raw["Exposure Time"],
                 raw_model["time"],
@@ -682,8 +712,9 @@ if submitted:
                 "Pa",
                 "0-1",
                 "cm2",
+                "%",
+                "ug, total",
                 "ug/cm2",
-                "ug",
                 "%",
                 "h",
                 "0: <=1 h, 1: <=12 h, 2: <=24 h, 3: >24 h",
