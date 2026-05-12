@@ -200,6 +200,7 @@ MODEL_PATH_FALLBACK = os.path.join("model weight", "2026_GAT_model_fold1_rev_v2.
 SCALER_PATH = "scaler_params.json"
 DB_PATH = "processed_test_target.xlsx"
 OUTLIERS_PATH = "outliers.xlsx"
+REFERENCE_ACTIVE_DOSE = 100.0  # ug/cm2
 
 CUSTOM_OBJECTS = {
     "HeteroGNN": HeteroGNN,
@@ -237,7 +238,6 @@ EXPERIMENT_NUMERIC_INPUTS = [
     "Exposure Time",
     "Skin Thickness",
     "Active Ingredient Content",
-    "Vehicle Load",
 ]
 
 NUMERIC_INPUTS = CHEM_NUMERIC_INPUTS + EXPERIMENT_NUMERIC_INPUTS
@@ -318,7 +318,7 @@ UNITS = {
     "Skin Thickness": "um",
     "Active Ingredient Content": "%",
     "Init_Load_Area": "ug/cm2, calculated",
-    "Vehicle Load": "ug, total formulation/vehicle amount",
+    "Vehicle Load": "ug, calculated total formulation/vehicle amount",
     "Enhancer_ratio": "0-1",
 }
 
@@ -497,15 +497,32 @@ def skin_thickness_to_cat(thickness_um):
     return 2
 
 
-def calc_active_load_area(active_content_percent, vehicle_load, appl_area):
+def calc_vehicle_load_for_reference_dose(active_content_percent, appl_area):
     """
-    Active load per area:
-      active_load_total = vehicle_load * active_content_percent / 100
-      Init_Load_Area = active_load_total / appl_area
+    Calculate total vehicle/formulation dose needed to set active load per area
+    to REFERENCE_ACTIVE_DOSE.
+
+      active_load_total = REFERENCE_ACTIVE_DOSE * Appl_area
+      active_content_fraction = Active Ingredient Content / 100
+      Vehicle Load = active_load_total / active_content_fraction
     """
-    active_load_total = float(vehicle_load) * float(active_content_percent) / 100.0
-    appl_area = max(float(appl_area), 1e-9)
-    return active_load_total / appl_area
+    active_content_percent = float(active_content_percent)
+    appl_area = float(appl_area)
+
+    if active_content_percent <= 0:
+        return np.nan
+
+    active_content_fraction = active_content_percent / 100.0
+    active_load_total = REFERENCE_ACTIVE_DOSE * appl_area
+
+    return active_load_total / active_content_fraction
+
+
+def calc_active_load_area():
+    """
+    The web app is designed to predict at the reference active dose.
+    """
+    return REFERENCE_ACTIVE_DOSE
 
 
 def calc_conc(active_content_percent):
@@ -513,7 +530,7 @@ def calc_conc(active_content_percent):
     Training definition:
       Conc = Active Load / Vehicle Load * 100
 
-    If the user enters active ingredient content (%), Conc is equal to that value.
+    With active ingredient content (%) as input, Conc is equal to that value.
     """
     return float(active_content_percent)
 
@@ -553,9 +570,11 @@ def apply_training_transforms(raw):
 
     x["time"] = exposure_to_time_cat(x["Exposure Time"])
     x["skin_thickness_cat"] = skin_thickness_to_cat(x["Skin Thickness"])
-    x["Init_Load_Area"] = calc_active_load_area(
+
+    # Force prediction condition to the reference active dose.
+    x["Init_Load_Area"] = calc_active_load_area()
+    x["Vehicle Load"] = calc_vehicle_load_for_reference_dose(
         active_content_percent=x["Active Ingredient Content"],
-        vehicle_load=x["Vehicle Load"],
         appl_area=x["Appl_area"],
     )
     x["Conc"] = calc_conc(x["Active Ingredient Content"])
@@ -624,11 +643,8 @@ def validate_inputs(raw):
     if float(raw.get("Appl_area", 0.0)) <= 0:
         errors.append("Appl_area must be greater than 0 cm2.")
 
-    if float(raw.get("Vehicle Load", 0.0)) <= 0:
-        errors.append("Vehicle Load must be greater than 0 ug.")
-
-    if float(raw.get("Active Ingredient Content", 0.0)) < 0:
-        errors.append("Active Ingredient Content cannot be negative.")
+    if float(raw.get("Active Ingredient Content", 0.0)) <= 0:
+        errors.append("Active Ingredient Content must be greater than 0%.")
 
     if float(raw.get("Skin Thickness", 0.0)) <= 0:
         errors.append("Skin Thickness must be greater than 0 um.")
@@ -689,6 +705,173 @@ def build_model_inputs(raw, cat, scaler_params, outlier_limits):
     return raw_model, x_p, x_v, x_s, x_e
 
 
+def predict_single(model, raw, cat, scaler_params, outlier_limits):
+    raw_model, x_p, x_v, x_s, x_e = build_model_inputs(
+        raw,
+        cat,
+        scaler_params,
+        outlier_limits,
+    )
+
+    Xp = np.array([x_p], dtype=np.float32)
+    Xv = np.array([x_v], dtype=np.float32)
+    Xs = np.array([x_s], dtype=np.float32)
+    Xe = np.array([x_e], dtype=np.float32)
+
+    y_log = float(model.predict([Xp, Xv, Xs, Xe], verbose=0).reshape(-1)[0])
+    y_log = max(y_log, 0.0)
+    y_abs = float(np.expm1(y_log))
+
+    return y_log, y_abs, raw_model, x_p, x_v, x_s, x_e
+
+
+def compute_data_reliability(raw_model, scaler_params):
+    """
+    Numeric data reliability score based on how close the input condition is to
+    the training distribution represented by scaler mean/std.
+
+    This is not a true prediction confidence interval. It is a data-similarity
+    reliability score for new/unseen inputs.
+    """
+    checked_features = [
+        "Molecular Weight",
+        "LogKow",
+        "TPSA",
+        "Water Solubility",
+        "Melting Point",
+        "Boiling Point",
+        "Vapor Pressure",
+        "Density",
+        "Enhancer_logKow",
+        "Enhancer_vap",
+        "Appl_area",
+    ]
+
+    rows = []
+
+    for feat in checked_features:
+        if feat not in scaler_params.index:
+            continue
+
+        mean = float(scaler_params.loc[feat, "mean"])
+        std = float(scaler_params.loc[feat, "std"])
+        std = std if std != 0 else 1e-9
+
+        value = float(raw_model.get(feat, 0.0))
+        z = (value - mean) / std
+        abs_z = abs(z)
+
+        if abs_z <= 2:
+            feature_score = 100.0
+            status = "Typical"
+        elif abs_z <= 3:
+            feature_score = 100.0 - 40.0 * (abs_z - 2.0)
+            status = "Boundary"
+        else:
+            feature_score = max(0.0, 60.0 - 20.0 * (abs_z - 3.0))
+            status = "Outside"
+
+        rows.append(
+            {
+                "Feature": feat,
+                "Input value": value,
+                "Training mean": mean,
+                "Training std": std,
+                "Abs z-score": abs_z,
+                "Feature reliability": feature_score,
+                "Status": status,
+            }
+        )
+
+    reliability_df = pd.DataFrame(rows)
+
+    if reliability_df.empty:
+        return 0.0, "Unknown", "Reliability could not be calculated.", reliability_df
+
+    score = float(reliability_df["Feature reliability"].mean())
+    max_z = float(reliability_df["Abs z-score"].max())
+    n_outside = int((reliability_df["Status"] == "Outside").sum())
+
+    if score >= 80:
+        level = "High"
+    elif score >= 60:
+        level = "Moderate"
+    else:
+        level = "Low"
+
+    message = (
+        f"{score:.1f}/100 ({level}) | max |z| = {max_z:.2f}, "
+        f"outside features = {n_outside}"
+    )
+
+    return score, level, message, reliability_df
+
+
+def make_sensitivity_values(option, raw):
+    current = float(raw.get(option, 0.0))
+
+    if option == "Exposure Time":
+        return np.array([0.5, 1, 3, 6, 12, 24, 48], dtype=float)
+
+    if option == "Active Ingredient Content":
+        current = max(float(raw.get("Active Ingredient Content", 1.0)), 0.1)
+        upper = min(100.0, max(10.0, current * 5.0))
+        lower = max(0.1, min(current * 0.2, upper))
+        return np.linspace(lower, upper, 20)
+
+    if option == "Skin Thickness":
+        return np.array([50, 100, 200, 500, 1000, 2000, 3000], dtype=float)
+
+    if option == "Enhancer_ratio":
+        return np.linspace(0.0, 1.0, 21)
+
+    return np.array([], dtype=float)
+
+
+def build_sensitivity_df(
+    option,
+    raw,
+    cat,
+    model,
+    scaler_params,
+    outlier_limits,
+    enhancer_type,
+):
+    if option == "Enhancer_ratio" and enhancer_type == "None":
+        return pd.DataFrame()
+
+    values = make_sensitivity_values(option, raw)
+    records = []
+
+    for v in values:
+        raw_i = raw.copy()
+
+        if option == "Enhancer_ratio":
+            raw_i["Enhancer_ratio"] = float(v)
+        else:
+            raw_i[option] = float(v)
+
+        y_log_i, y_abs_i, raw_model_i, *_ = predict_single(
+            model,
+            raw_i,
+            cat,
+            scaler_params,
+            outlier_limits,
+        )
+
+        records.append(
+            {
+                option: float(v),
+                "Predicted MM-converted Absorption (%)": y_abs_i,
+                "Predicted log(1 + Abs%)": y_log_i,
+                "Calculated Vehicle Load (ug)": raw_model_i["Vehicle Load"],
+                "skin_thickness_cat": raw_model_i.get("skin_thickness_cat"),
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
 def label_for(feat):
     display_names = {
         "Water Solubility": "log_Water Solubility",
@@ -726,6 +909,9 @@ under a reference active ingredient dose (100 µg/cm²).
 Users can:
 1. Search a local chemical database Excel file to auto-fill physicochemical properties.
 2. Enter experiment, vehicle, and skin conditions to generate a prediction.
+
+The app automatically calculates the total vehicle/formulation dose needed for the
+reference active ingredient dose of 100 µg/cm².
 """
 )
 
@@ -834,7 +1020,21 @@ if st.button("Search"):
 # Inputs
 # -------------------------
 st.header("2) Inputs")
-st.caption("Enter test conditions and chemical properties below.")
+st.caption(
+    "Enter test conditions and chemical properties below. "
+    "Vehicle/Formulation dose is calculated automatically for 100 µg/cm² active dose."
+)
+
+sensitivity_option = st.selectbox(
+    "Sensitivity plot",
+    [
+        "Exposure Time",
+        "Active Ingredient Content",
+        "Skin Thickness",
+        "Enhancer_ratio",
+    ],
+    index=0,
+)
 
 # Keep enhancer widgets outside the form so the ratio/manual fields update immediately
 # when the user changes Enhancer type.
@@ -960,22 +1160,35 @@ if submitted:
 
     try:
         with st.spinner("Running DermGAT prediction..."):
-            raw_model, x_p, x_v, x_s, x_e = build_model_inputs(raw, cat, scaler_params, outlier_limits)
-
-            Xp = np.array([x_p], dtype=np.float32)
-            Xv = np.array([x_v], dtype=np.float32)
-            Xs = np.array([x_s], dtype=np.float32)
-            Xe = np.array([x_e], dtype=np.float32)
-
-            y_log = float(model.predict([Xp, Xv, Xs, Xe], verbose=0).reshape(-1)[0])
-            y_log = max(y_log, 0.0)
-            y_abs = float(np.expm1(y_log))
+            y_log, y_abs, raw_model, x_p, x_v, x_s, x_e = predict_single(
+                model,
+                raw,
+                cat,
+                scaler_params,
+                outlier_limits,
+            )
 
         st.success("Prediction completed.")
 
         st.header("Result")
-        st.metric("Predicted log(1 + Abs%)", f"{y_log:.4f}")
-        st.metric("Predicted MM-converted Absorption (%)", f"{y_abs:.4f}")
+
+        reliability_score, reliability_level, reliability_message, reliability_df = compute_data_reliability(
+            raw_model,
+            scaler_params,
+        )
+
+        result_col1, result_col2 = st.columns(2)
+        result_col1.metric("Predicted MM-converted Absorption (%)", f"{y_abs:.4f}")
+        result_col2.metric("Data Reliability", f"{reliability_score:.1f}/100", reliability_level)
+
+        st.caption(f"Model output: log(1 + Abs%) = {y_log:.4f}")
+
+        if reliability_level == "High":
+            st.success(reliability_message)
+        elif reliability_level == "Moderate":
+            st.warning(reliability_message)
+        else:
+            st.error(reliability_message)
 
         # =================================================
         # 1) Input Summary
@@ -1007,8 +1220,8 @@ if submitted:
                     "Enhancer vapor pressure, auto-filled",
                     "Application area",
                     "Active ingredient content",
-                    "Vehicle load",
-                    "Calculated active load per area",
+                    "Calculated vehicle/formulation dose",
+                    "Reference active load per area",
                     "Calculated concentration",
                     "Exposure time",
                     "Time category",
@@ -1065,7 +1278,7 @@ if submitted:
                     "Pa",
                     "cm2",
                     "%",
-                    "ug, total",
+                    "ug, calculated total",
                     "ug/cm2",
                     "%",
                     "h",
@@ -1083,38 +1296,80 @@ if submitted:
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
         # =================================================
-        # 3) Dose Context
+        # Prediction Condition Summary
         # =================================================
-        st.subheader("Dose Context")
+        st.subheader("Prediction Condition Summary")
 
-        input_dose = float(raw_model["Init_Load_Area"])
-        reference_dose = 100.0
-        dose_ratio = input_dose / reference_dose if reference_dose > 0 else np.nan
-
-        dose_df = pd.DataFrame(
+        condition_df = pd.DataFrame(
             {
-                "Dose": ["Input active load", "Model reference active load"],
-                "ug/cm2": [input_dose, reference_dose],
+                "Condition": [
+                    "Reference active dose",
+                    "Calculated vehicle/formulation dose",
+                    "Application area",
+                    "Active ingredient content",
+                    "Exposure time",
+                    "Skin thickness category",
+                    "Enhancer type",
+                ],
+                "Value": [
+                    f"{REFERENCE_ACTIVE_DOSE:.1f}",
+                    f"{raw_model['Vehicle Load']:.4f}",
+                    f"{raw_model['Appl_area']:.4f}",
+                    f"{raw_model['Active Ingredient Content']:.4f}",
+                    f"{raw_model['Exposure Time']:.4f}",
+                    f"{int(raw_model['skin_thickness_cat'])}",
+                    enhancer_type,
+                ],
+                "Unit": [
+                    "ug/cm2",
+                    "ug",
+                    "cm2",
+                    "%",
+                    "h",
+                    "0: thin, 1: medium, 2: thick",
+                    "-",
+                ],
             }
         )
 
-        st.bar_chart(dose_df.set_index("Dose"))
+        st.dataframe(condition_df, use_container_width=True, hide_index=True)
 
-        st.write(
-            f"Input active load is **{dose_ratio:.2f}x** of the model reference dose "
-            f"(**100 ug/cm2**)."
+        # =================================================
+        # Data Reliability details
+        # =================================================
+        with st.expander("Data Reliability details"):
+            st.dataframe(
+                reliability_df.sort_values("Abs z-score", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # =================================================
+        # Sensitivity Plot
+        # =================================================
+        st.subheader("Sensitivity Plot")
+
+        sensitivity_df = build_sensitivity_df(
+            sensitivity_option,
+            raw,
+            cat,
+            model,
+            scaler_params,
+            outlier_limits,
+            enhancer_type,
         )
 
-        if dose_ratio < 0.5 or dose_ratio > 2:
-            st.warning(
-                "The input active load is outside the 0.5x-2x range of the model reference dose. "
-                "Interpret the prediction carefully because the output is calibrated to "
-                "MM-converted absorption at 100 ug/cm2."
-            )
+        if sensitivity_df.empty:
+            st.info("Select an enhancer other than None to view Enhancer_ratio sensitivity.")
         else:
-            st.success(
-                "The input active load is within the 0.5x-2x range of the model reference dose."
+            st.line_chart(
+                sensitivity_df.set_index(sensitivity_option)[
+                    "Predicted MM-converted Absorption (%)"
+                ]
             )
+
+            with st.expander("Sensitivity data"):
+                st.dataframe(sensitivity_df, use_container_width=True, hide_index=True)
 
         if show_debug:
             st.subheader("Debug")
