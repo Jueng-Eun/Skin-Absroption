@@ -221,13 +221,50 @@ SCALED_FEATURES = [
     "Appl_area",
 ]
 
-NUMERIC_INPUTS = SCALED_FEATURES + [
+CHEM_NUMERIC_INPUTS = [
+    "Molecular Weight",
+    "LogKow",
+    "TPSA",
+    "Water Solubility",
+    "Melting Point",
+    "Boiling Point",
+    "Vapor Pressure",
+    "Density",
+    "Appl_area",
+]
+
+EXPERIMENT_NUMERIC_INPUTS = [
     "Exposure Time",
     "Skin Thickness",
     "Active Ingredient Content",
     "Vehicle Load",
-    "Enhancer_ratio",
 ]
+
+NUMERIC_INPUTS = CHEM_NUMERIC_INPUTS + EXPERIMENT_NUMERIC_INPUTS
+
+ENHANCER_PRESETS = {
+    "None": {
+        "Enhancer_ratio": 0.0,
+        "Enhancer_logKow": 0.0,
+        "Enhancer_vap": 0.0,
+    },
+    "ethanol": {
+        "Enhancer_logKow": -0.31,
+        "Enhancer_vap": 59.3,
+    },
+    "acetone": {
+        "Enhancer_logKow": -0.24,
+        "Enhancer_vap": 232.0,
+    },
+    "methanol": {
+        "Enhancer_logKow": -0.77,
+        "Enhancer_vap": 127.0,
+    },
+    "propylene glycol": {
+        "Enhancer_logKow": -0.92,
+        "Enhancer_vap": 0.13,
+    },
+}
 
 LABEL_MAPS = {
     "Skin Type": {"human": 1, "pig": 2, "rat": 3, "guineapig": 4, "mouse": 5, "rabbit": 6},
@@ -270,15 +307,15 @@ UNITS = {
     "Melting Point": "deg C",
     "Boiling Point": "deg C",
     "Density": "g/mL",
-    "Enhancer_logKow": "-",
-    "Enhancer_vap": "Pa",
+    "Enhancer_logKow": "-, auto-filled from enhancer type",
+    "Enhancer_vap": "Pa, auto-filled from enhancer type",
     "Appl_area": "cm2",
     "Exposure Time": "h",
     "Skin Thickness": "um",
     "Active Ingredient Content": "%",
     "Init_Load_Area": "ug/cm2, calculated",
     "Vehicle Load": "ug, total formulation/vehicle amount",
-    "Enhancer_ratio": "0-1",
+    "Enhancer_ratio": "0-1, used only if enhancer is selected",
 }
 
 
@@ -415,6 +452,22 @@ def calc_conc(active_content_percent):
     return float(active_content_percent)
 
 
+def apply_enhancer_settings(raw, enhancer_type, enhancer_ratio):
+    x = raw.copy()
+
+    if enhancer_type == "None":
+        x["Enhancer_ratio"] = 0.0
+        x["Enhancer_logKow"] = 0.0
+        x["Enhancer_vap"] = 0.0
+        return x
+
+    preset = ENHANCER_PRESETS[enhancer_type]
+    x["Enhancer_ratio"] = float(enhancer_ratio)
+    x["Enhancer_logKow"] = float(preset["Enhancer_logKow"])
+    x["Enhancer_vap"] = float(preset["Enhancer_vap"])
+    return x
+
+
 def apply_training_transforms(raw):
     x = raw.copy()
 
@@ -493,6 +546,11 @@ def validate_inputs(raw):
     if float(raw.get("Skin Thickness", 0.0)) <= 0:
         errors.append("Skin Thickness must be greater than 0 um.")
 
+    if "Enhancer_ratio" in raw:
+        enhancer_ratio = float(raw.get("Enhancer_ratio", 0.0))
+        if enhancer_ratio < 0 or enhancer_ratio > 1:
+            errors.append("Enhancer_ratio must be between 0 and 1.")
+
     # Water Solubility and Vapor Pressure are log-transformed inputs.
     # Negative values are valid and should not be blocked.
 
@@ -548,6 +606,7 @@ def label_for(feat):
         "Vehicle Load": "Vehicle/Formulation dose",
         "Active Ingredient Content": "Active Ingredient Content",
         "Skin Thickness": "Skin Thickness",
+        "Enhancer_ratio": "Enhancer ratio",
     }
     name = display_names.get(feat, feat)
     unit = UNITS.get(feat)
@@ -638,6 +697,9 @@ if st.button("Search"):
             excel_to_internal = {
                 "log_Water Solubility": "Water Solubility",
                 "log_Vapor Pressure": "Vapor Pressure",
+                "Enhancer_logKow": "Enhancer_logKow",
+                "Enhancer_vap": "Enhancer_vap",
+                "Enhancer_ratio": "Enhancer_ratio",
             }
 
             for feat in SCALED_FEATURES:
@@ -705,6 +767,41 @@ with st.form("prediction_form"):
             )
         )
 
+    st.subheader("Enhancer inputs")
+
+    enhancer_choices = list(ENHANCER_PRESETS.keys())
+    enhancer_type = st.selectbox(
+        "Enhancer type",
+        enhancer_choices,
+        index=0,
+        help="If no enhancer is used, select None. The app sets Enhancer_ratio, Enhancer_logKow, and Enhancer_vap to 0.",
+    )
+
+    if enhancer_type == "None":
+        raw["Enhancer_ratio"] = 0.0
+        raw["Enhancer_logKow"] = 0.0
+        raw["Enhancer_vap"] = 0.0
+        st.info("No enhancer selected: Enhancer_ratio, Enhancer_logKow, and Enhancer_vap are set to 0.")
+    else:
+        default_ratio = float(st.session_state.raw_defaults.get("Enhancer_ratio", ENHANCER_PRESETS[enhancer_type].get("Enhancer_ratio", 1.0)))
+        raw["Enhancer_ratio"] = float(
+            st.number_input(
+                "Enhancer_ratio (0-1)",
+                min_value=0.0,
+                max_value=1.0,
+                value=max(0.0, min(1.0, default_ratio)),
+                step=0.01,
+                format="%.4f",
+            )
+        )
+        raw = apply_enhancer_settings(raw, enhancer_type, raw["Enhancer_ratio"])
+
+        st.caption(
+            f"Auto-filled {enhancer_type}: "
+            f"Enhancer_logKow = {raw['Enhancer_logKow']}, "
+            f"Enhancer_vap = {raw['Enhancer_vap']} Pa"
+        )
+
     st.subheader("Categorical inputs")
 
     for cat_name in CATEGORICAL_INPUTS:
@@ -768,7 +865,10 @@ if submitted:
                     "Density",
                     "Enhancer logKow",
                     "Enhancer vapor pressure",
+                    "Enhancer type",
                     "Enhancer ratio",
+                    "Enhancer logKow, auto-filled",
+                    "Enhancer vapor pressure, auto-filled",
                     "Application area",
                     "Active ingredient content",
                     "Vehicle load",
@@ -794,7 +894,10 @@ if submitted:
                     raw_model["Density"],
                     raw_model["Enhancer_logKow"],
                     raw_model["Enhancer_vap"],
+                    enhancer_type,
                     raw_model["Enhancer_ratio"],
+                    raw_model["Enhancer_logKow"],
+                    raw_model["Enhancer_vap"],
                     raw_model["Appl_area"],
                     raw_model["Active Ingredient Content"],
                     raw_model["Vehicle Load"],
@@ -820,7 +923,10 @@ if submitted:
                     "g/mL",
                     "-",
                     "Pa",
+                    "selected",
                     "0-1",
+                    "-",
+                    "Pa",
                     "cm2",
                     "%",
                     "ug, total",
@@ -878,6 +984,7 @@ if submitted:
             st.subheader("Debug")
             st.json(
                 {
+                    "enhancer_type": enhancer_type,
                     "raw_after_preprocessing": raw_model,
                     "categorical_codes": {**cat, "skin_thickness_cat": int(raw_model["skin_thickness_cat"])},
                     "x_p_9": x_p,
