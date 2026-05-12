@@ -13,6 +13,13 @@ Required files:
   - scaler_params.json, scaler_params.joblib, or scaler_params.pkl
   - outliers.xlsx
   - processed_test_target.xlsx  # optional, only for chemical search
+
+Notes:
+  processed_test_target.xlsx is expected to contain:
+    - log_Vapor Pressure
+    - log_Water Solubility
+
+  The app uses these log-transformed values directly.
 """
 
 import os
@@ -258,8 +265,8 @@ UNITS = {
     "Molecular Weight": "g/mol",
     "LogKow": "-",
     "TPSA": "A^2",
-    "Water Solubility": "mg/L, raw input",
-    "Vapor Pressure": "mmHg, raw input",
+    "Water Solubility": "log(mg/L + 1e-5), input value",
+    "Vapor Pressure": "log(mmHg + 1e-5), input value",
     "Melting Point": "deg C",
     "Boiling Point": "deg C",
     "Density": "g/mL",
@@ -411,8 +418,14 @@ def calc_conc(active_content_percent):
 def apply_training_transforms(raw):
     x = raw.copy()
 
-    x["Water Solubility"] = np.round(np.log(float(x["Water Solubility"]) + 1e-5), 3)
-    x["Vapor Pressure"] = np.round(np.log(float(x["Vapor Pressure"]) + 1e-5), 3)
+    # processed_test_target.xlsx now stores these as log-transformed columns:
+    #   log_Water Solubility
+    #   log_Vapor Pressure
+    # In the app we keep the internal scaler keys as "Water Solubility" and
+    # "Vapor Pressure", but the values are already log-transformed.
+    x["Water Solubility"] = float(x["Water Solubility"])
+    x["Vapor Pressure"] = float(x["Vapor Pressure"])
+
     x["time"] = exposure_to_time_cat(x["Exposure Time"])
     x["skin_thickness_cat"] = skin_thickness_to_cat(x["Skin Thickness"])
     x["Init_Load_Area"] = calc_active_load_area(
@@ -480,11 +493,8 @@ def validate_inputs(raw):
     if float(raw.get("Skin Thickness", 0.0)) <= 0:
         errors.append("Skin Thickness must be greater than 0 um.")
 
-    if float(raw.get("Water Solubility", 0.0)) < 0:
-        errors.append("Water Solubility cannot be negative.")
-
-    if float(raw.get("Vapor Pressure", 0.0)) < 0:
-        errors.append("Vapor Pressure cannot be negative.")
+    # Water Solubility and Vapor Pressure are log-transformed inputs.
+    # Negative values are valid and should not be blocked.
 
     if errors:
         for msg in errors:
@@ -532,8 +542,16 @@ def build_model_inputs(raw, cat, scaler_params, outlier_limits):
 
 
 def label_for(feat):
+    display_names = {
+        "Water Solubility": "log_Water Solubility",
+        "Vapor Pressure": "log_Vapor Pressure",
+        "Vehicle Load": "Vehicle/Formulation dose",
+        "Active Ingredient Content": "Active Ingredient Content",
+        "Skin Thickness": "Skin Thickness",
+    }
+    name = display_names.get(feat, feat)
     unit = UNITS.get(feat)
-    return f"{feat} ({unit})" if unit else feat
+    return f"{name} ({unit})" if unit else name
 
 
 def get_row_float(row, col):
@@ -560,6 +578,8 @@ The app calculates:
 
 It also calculates:
 `skin_thickness_cat` from actual skin thickness in um.
+
+`log_Water Solubility` and `log_Vapor Pressure` from processed_test_target.xlsx are used directly.
 
 Model: `2026_GAT_model_fold1_rev_v2.keras`
 """
@@ -612,8 +632,29 @@ if st.button("Search"):
             st.success("Match found.")
             st.dataframe(hits.head(5))
 
+            # Map Excel column names to internal model/scaler keys.
+            # processed_test_target.xlsx uses log_* column names, while the scaler
+            # was fitted using the original keys "Water Solubility" and "Vapor Pressure".
+            excel_to_internal = {
+                "log_Water Solubility": "Water Solubility",
+                "log_Vapor Pressure": "Vapor Pressure",
+            }
+
             for feat in SCALED_FEATURES:
-                val = get_row_float(row, feat)
+                source_col = None
+
+                if feat in row.index:
+                    source_col = feat
+                else:
+                    for excel_col, internal_col in excel_to_internal.items():
+                        if internal_col == feat and excel_col in row.index:
+                            source_col = excel_col
+                            break
+
+                if source_col is None:
+                    continue
+
+                val = get_row_float(row, source_col)
                 if val is not None:
                     st.session_state.raw_defaults[feat] = val
 
@@ -642,8 +683,8 @@ st.header("2) Inputs")
 st.caption(
     "Enter active ingredient content (%), application area (cm2), total vehicle/formulation dose (ug), "
     "and actual skin thickness (um). The app calculates active load per area, concentration, "
-    "and skin_thickness_cat automatically. Water Solubility and Vapor Pressure are entered as raw values "
-    "and log-transformed internally."
+    "and skin_thickness_cat automatically. Water Solubility and Vapor Pressure should be entered "
+    "as log-transformed values matching processed_test_target.xlsx."
 )
 
 with st.form("prediction_form"):
@@ -720,8 +761,8 @@ if submitted:
                     "Molecular Weight",
                     "LogKow",
                     "TPSA",
-                    "Water Solubility, log-transformed",
-                    "Vapor Pressure, log-transformed",
+                    "log_Water Solubility",
+                    "log_Vapor Pressure",
                     "Melting Point",
                     "Boiling Point",
                     "Density",
@@ -772,8 +813,8 @@ if submitted:
                     "g/mol",
                     "-",
                     "A^2",
-                    "log(mg/L + 1e-5)",
-                    "log(mmHg + 1e-5)",
+                    "log(mg/L + 1e-5), input value",
+                    "log(mmHg + 1e-5), input value",
                     "deg C",
                     "deg C",
                     "g/mL",
