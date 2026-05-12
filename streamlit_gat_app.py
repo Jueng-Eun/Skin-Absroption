@@ -529,35 +529,18 @@ def scale_features(raw_model, scaler_params):
     scaled = {}
 
     for feat in SCALED_FEATURES:
-        value = float(raw_model.get(feat, 0.0))
+        if feat not in scaler_params.index:
+            st.error(
+                f"Missing scaler parameter: {feat}. "
+                "Please check scaler_params.json."
+            )
+            st.stop()
 
-        # Normal case: scaler_params index uses raw feature names.
-        if feat in scaler_params.index:
-            mean = float(scaler_params.loc[feat, "mean"])
-            std = float(scaler_params.loc[feat, "std"])
-            std = std if std != 0 else 1e-9
-            scaled[f"scaled_{feat}"] = (value - mean) / std
-            continue
+        mean = float(scaler_params.loc[feat, "mean"])
+        std = float(scaler_params.loc[feat, "std"])
+        std = std if std != 0 else 1e-9
 
-        # Compatibility case: scaler_params index uses scaled_* names.
-        scaled_key = f"scaled_{feat}"
-        if scaled_key in scaler_params.index:
-            mean = float(scaler_params.loc[scaled_key, "mean"])
-            std = float(scaler_params.loc[scaled_key, "std"])
-            std = std if std != 0 else 1e-9
-            scaled[scaled_key] = (value - mean) / std
-            continue
-
-        # Enhancer=None case:
-        # If no enhancer is selected, Enhancer_logKow and Enhancer_vap are set to 0.
-        # When scaler parameters for these enhancer fields are absent, use 0 directly
-        # so the vehicle block receives a neutral enhancer input.
-        if feat in ["Enhancer_logKow", "Enhancer_vap"] and value == 0.0:
-            scaled[scaled_key] = 0.0
-            continue
-
-        st.error(f"Missing scaler parameter: {feat}")
-        st.stop()
+        scaled[f"scaled_{feat}"] = (float(raw_model[feat]) - mean) / std
 
     return scaled
 
