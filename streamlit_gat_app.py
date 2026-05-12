@@ -264,6 +264,10 @@ ENHANCER_PRESETS = {
         "Enhancer_logKow": -0.92,
         "Enhancer_vap": 0.13,
     },
+    "Other": {
+        "Enhancer_logKow": None,
+        "Enhancer_vap": None,
+    },
 }
 
 LABEL_MAPS = {
@@ -461,6 +465,12 @@ def apply_enhancer_settings(raw, enhancer_type, enhancer_ratio):
         x["Enhancer_vap"] = 0.0
         return x
 
+    if enhancer_type == "Other":
+        x["Enhancer_ratio"] = float(enhancer_ratio)
+        x["Enhancer_logKow"] = float(x.get("Enhancer_logKow", 0.0))
+        x["Enhancer_vap"] = float(x.get("Enhancer_vap", 0.0))
+        return x
+
     preset = ENHANCER_PRESETS[enhancer_type]
     x["Enhancer_ratio"] = float(enhancer_ratio)
     x["Enhancer_logKow"] = float(preset["Enhancer_logKow"])
@@ -551,6 +561,9 @@ def validate_inputs(raw):
         if enhancer_ratio < 0 or enhancer_ratio > 1:
             errors.append("Enhancer_ratio must be between 0 and 1.")
 
+    if "Enhancer_vap" in raw and float(raw.get("Enhancer_vap", 0.0)) < 0:
+        errors.append("Enhancer_vap cannot be negative.")
+
     # Water Solubility and Vapor Pressure are log-transformed inputs.
     # Negative values are valid and should not be blocked.
 
@@ -639,6 +652,8 @@ It also calculates:
 `skin_thickness_cat` from actual skin thickness in um.
 
 `log_Water Solubility` and `log_Vapor Pressure` from processed_test_target.xlsx are used directly.
+
+Enhancer presets are available for ethanol, acetone, methanol, and propylene glycol. Select Other to enter Enhancer_logKow and Enhancer_vap manually.
 
 Model: `2026_GAT_model_fold1_rev_v2.keras`
 """
@@ -774,7 +789,12 @@ with st.form("prediction_form"):
         "Enhancer type",
         enhancer_choices,
         index=0,
-        help="If no enhancer is used, select None. The app sets Enhancer_ratio, Enhancer_logKow, and Enhancer_vap to 0.",
+        help=(
+            "If no enhancer is used, select None. "
+            "For ethanol, acetone, methanol, and propylene glycol, "
+            "Enhancer_logKow and Enhancer_vap are auto-filled. "
+            "For Other, enter Enhancer_logKow and Enhancer_vap manually."
+        ),
     )
 
     if enhancer_type == "None":
@@ -782,8 +802,49 @@ with st.form("prediction_form"):
         raw["Enhancer_logKow"] = 0.0
         raw["Enhancer_vap"] = 0.0
         st.info("No enhancer selected: Enhancer_ratio, Enhancer_logKow, and Enhancer_vap are set to 0.")
+
+    elif enhancer_type == "Other":
+        default_ratio = float(st.session_state.raw_defaults.get("Enhancer_ratio", 1.0))
+        raw["Enhancer_ratio"] = float(
+            st.number_input(
+                "Enhancer_ratio (0-1)",
+                min_value=0.0,
+                max_value=1.0,
+                value=max(0.0, min(1.0, default_ratio)),
+                step=0.01,
+                format="%.4f",
+            )
+        )
+
+        c_enh1, c_enh2 = st.columns(2)
+        raw["Enhancer_logKow"] = float(
+            c_enh1.number_input(
+                "Enhancer_logKow (-)",
+                value=float(st.session_state.raw_defaults.get("Enhancer_logKow", 0.0)),
+                step=0.01,
+                format="%.4f",
+            )
+        )
+        raw["Enhancer_vap"] = float(
+            c_enh2.number_input(
+                "Enhancer_vap (Pa)",
+                value=float(st.session_state.raw_defaults.get("Enhancer_vap", 0.0)),
+                step=0.01,
+                format="%.4f",
+            )
+        )
+
+        st.caption(
+            "Other enhancer selected: user-provided Enhancer_logKow and Enhancer_vap are used."
+        )
+
     else:
-        default_ratio = float(st.session_state.raw_defaults.get("Enhancer_ratio", ENHANCER_PRESETS[enhancer_type].get("Enhancer_ratio", 1.0)))
+        default_ratio = float(
+            st.session_state.raw_defaults.get(
+                "Enhancer_ratio",
+                ENHANCER_PRESETS[enhancer_type].get("Enhancer_ratio", 1.0),
+            )
+        )
         raw["Enhancer_ratio"] = float(
             st.number_input(
                 "Enhancer_ratio (0-1)",
