@@ -248,19 +248,19 @@ ENHANCER_PRESETS = {
         "Enhancer_logKow": 0.0,
         "Enhancer_vap": 0.0,
     },
-    "ethanol": {
+    "Ethanol": {
         "Enhancer_logKow": -0.31,
         "Enhancer_vap": 59.3,
     },
-    "acetone": {
+    "Acetone": {
         "Enhancer_logKow": -0.24,
         "Enhancer_vap": 232.0,
     },
-    "methanol": {
+    "Methanol": {
         "Enhancer_logKow": -0.77,
         "Enhancer_vap": 127.0,
     },
-    "propylene glycol": {
+    "Propylene Glycol": {
         "Enhancer_logKow": -0.92,
         "Enhancer_vap": 0.13,
     },
@@ -319,7 +319,7 @@ UNITS = {
     "Active Ingredient Content": "%",
     "Init_Load_Area": "ug/cm2, calculated",
     "Vehicle Load": "ug, total formulation/vehicle amount",
-    "Enhancer_ratio": "0-1, used only if enhancer is selected",
+    "Enhancer_ratio": "0-1",
 }
 
 
@@ -643,19 +643,12 @@ st.title("DermGAT Dermal Absorption Prediction")
 
 st.markdown(
     """
-Predicts **MM-converted dermal absorption (%)** at **100 ug/cm2** active ingredient dose.
+This Streamlit app loads a pre-trained DermGAT model and predicts dermal absorption rate (%) 
+under a reference active ingredient dose (100 µg/cm²).
 
-The app calculates:
-`Init_Load_Area = Vehicle Load × Active Ingredient Content / 100 / Appl_area`
-
-It also calculates:
-`skin_thickness_cat` from actual skin thickness in um.
-
-`log_Water Solubility` and `log_Vapor Pressure` from processed_test_target.xlsx are used directly.
-
-Enhancer presets are available for ethanol, acetone, methanol, and propylene glycol. Select Other to enter Enhancer_logKow and Enhancer_vap manually.
-
-Model: `2026_GAT_model_fold1_rev_v2.keras`
+Users can:
+1. Search a local chemical database Excel file to auto-fill physicochemical properties.
+2. Enter experiment, vehicle, and skin conditions to generate a prediction.
 """
 )
 
@@ -757,12 +750,7 @@ if st.button("Search"):
 # Inputs
 # -------------------------
 st.header("2) Inputs")
-st.caption(
-    "Enter active ingredient content (%), application area (cm2), total vehicle/formulation dose (ug), "
-    "and actual skin thickness (um). The app calculates active load per area, concentration, "
-    "and skin_thickness_cat automatically. Water Solubility and Vapor Pressure should be entered "
-    "as log-transformed values matching processed_test_target.xlsx."
-)
+st.caption("Enter test conditions and chemical properties below.")
 
 with st.form("prediction_form"):
     raw = {}
@@ -785,29 +773,27 @@ with st.form("prediction_form"):
     st.subheader("Enhancer inputs")
 
     enhancer_choices = list(ENHANCER_PRESETS.keys())
+    enhancer_default = st.session_state.cat_defaults.get("Enhancer type", "None")
+    enhancer_default_idx = enhancer_choices.index(enhancer_default) if enhancer_default in enhancer_choices else 0
+
     enhancer_type = st.selectbox(
         "Enhancer type",
         enhancer_choices,
-        index=0,
-        help=(
-            "If no enhancer is used, select None. "
-            "For ethanol, acetone, methanol, and propylene glycol, "
-            "Enhancer_logKow and Enhancer_vap are auto-filled. "
-            "For Other, enter Enhancer_logKow and Enhancer_vap manually."
-        ),
+        index=enhancer_default_idx,
+        help="Select the enhancer used in the vehicle/formulation.",
     )
 
     if enhancer_type == "None":
         raw["Enhancer_ratio"] = 0.0
         raw["Enhancer_logKow"] = 0.0
         raw["Enhancer_vap"] = 0.0
-        st.info("No enhancer selected: Enhancer_ratio, Enhancer_logKow, and Enhancer_vap are set to 0.")
+        st.info("No enhancer selected.")
 
     elif enhancer_type == "Other":
         default_ratio = float(st.session_state.raw_defaults.get("Enhancer_ratio", 1.0))
         raw["Enhancer_ratio"] = float(
             st.number_input(
-                "Enhancer_ratio (0-1)",
+                "Enhancer ratio (0-1)",
                 min_value=0.0,
                 max_value=1.0,
                 value=max(0.0, min(1.0, default_ratio)),
@@ -834,9 +820,6 @@ with st.form("prediction_form"):
             )
         )
 
-        st.caption(
-            "Other enhancer selected: user-provided Enhancer_logKow and Enhancer_vap are used."
-        )
 
     else:
         default_ratio = float(
@@ -847,7 +830,7 @@ with st.form("prediction_form"):
         )
         raw["Enhancer_ratio"] = float(
             st.number_input(
-                "Enhancer_ratio (0-1)",
+                "Enhancer ratio (0-1)",
                 min_value=0.0,
                 max_value=1.0,
                 value=max(0.0, min(1.0, default_ratio)),
@@ -857,11 +840,6 @@ with st.form("prediction_form"):
         )
         raw = apply_enhancer_settings(raw, enhancer_type, raw["Enhancer_ratio"])
 
-        st.caption(
-            f"Auto-filled {enhancer_type}: "
-            f"Enhancer_logKow = {raw['Enhancer_logKow']}, "
-            f"Enhancer_vap = {raw['Enhancer_vap']} Pa"
-        )
 
     st.subheader("Categorical inputs")
 
