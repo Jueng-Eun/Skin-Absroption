@@ -1,82 +1,71 @@
 """
 Dermal Absorption Rate(%) Prediction App (Streamlit)
 ----------------------------------------------------
-This Streamlit app loads a pre-trained DermGAT model and
-predicts dermal absorption rate (%) under a reference active ingredient dose
-(100 µg/cm²). Users can (1) search a local chemical database Excel file to
-auto-fill physicochemical properties and (2) enter experiment/vehicle/skin
-conditions to generate a prediction.
+This Streamlit app loads the best DermGAT model:
+    2026_GAT_model_fold1_rev_v2.keras
 
-Notes for GitHub:
-- Keep model/scaler/outlier/DB files in the repo (or provide download instructions).
-- This script assumes the following files exist in the working directory:
-  - revised_GAT_model_fold1.keras
-  - scaler_params.json (or .joblib/.pkl bundle)
+The model predicts MM-converted dermal absorption (%) under the reference
+active ingredient dose of 100 ug/cm2.
+
+Expected files in the working directory:
+  - 2026_GAT_model_fold1_rev_v2.keras
+    or model weight/2026_GAT_model_fold1_rev_v2.keras
+  - scaler_params.json
+    or scaler_params.joblib / scaler_params.pkl
   - processed_test_target.xlsx
   - outliers.xlsx
+
+Important:
+  The feature schema, model class, and preprocessing here are matched to the
+  HeteroGNN_rev_v2 workflow:
+    x_p = phychem features, 9 columns
+    x_v = vehicle features, 4 columns
+    x_s = skin features, 3 columns
+    x_e = experiment features, 3 columns
 """
 
 import os
 import io
 import json
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 import tensorflow as tf
 from tensorflow.keras import layers
-import joblib
 
-# =========================================
-#  Custom layers / model (MUST match training)
-# =========================================
+
+# =====================================================
+# Custom model classes: MUST match 2026_GAT_model_fold1_rev_v2.keras
+# =====================================================
 @tf.keras.utils.register_keras_serializable(package="custom")
-class GraphAttentionLayer(tf.keras.layers.Layer):
-    def __init__(self, out_dim, dropout_rate=0.1, **kwargs):
+class GroupDenseEncoder(tf.keras.layers.Layer):
+    """
+    Tabular group encoder: (B, F_group) -> (B, D)
+    """
+
+    def __init__(self, dim_hidden=64, dropout=0.1, **kwargs):
         super().__init__(**kwargs)
-        self.out_dim = out_dim
-        self.dropout_rate = dropout_rate
-
-    def build(self, input_shape):
-        h_shape = input_shape[0] if isinstance(input_shape, (list, tuple)) else input_shape
-        in_dim = h_shape[-1]
-        self.W = self.add_weight(
-            shape=(in_dim, self.out_dim),
-            initializer="glorot_uniform",
-            trainable=True,
-            name="W",
+        self.dim_hidden = dim_hidden
+        self.dropout_rate = dropout
+        self.net = tf.keras.Sequential(
+            [
+                layers.LayerNormalization(),
+                layers.Dense(dim_hidden, activation="relu"),
+                layers.Dropout(dropout),
+                layers.Dense(dim_hidden, activation="relu"),
+            ]
         )
-        self.a = self.add_weight(
-            shape=(2 * self.out_dim, 1),
-            initializer="glorot_uniform",
-            trainable=True,
-            name="a",
-        )
-        self.leaky_relu = tf.keras.layers.LeakyReLU(0.2)
-        self.dropout = tf.keras.layers.Dropout(self.dropout_rate)
 
-    def call(self, inputs, training=False):
-        h, adj = inputs
-        Wh = tf.matmul(h, self.W)  # (B, N, out_dim)
-        N = tf.shape(adj)[-1]
-
-        Wh1 = tf.repeat(tf.expand_dims(Wh, 1), repeats=N, axis=1)  # (B, N, N, out_dim)
-        Wh2 = tf.repeat(tf.expand_dims(Wh, 2), repeats=N, axis=2)  # (B, N, N, out_dim)
-
-        e = self.leaky_relu(
-            tf.squeeze(tf.matmul(tf.concat([Wh1, Wh2], -1), self.a), -1)
-        )  # (B, N, N)
-
-        attn = tf.nn.softmax(e, axis=-1)
-        attn = self.dropout(attn, training=training)
-
-        # mask with adjacency (learned adjacency is broadcasted outside)
-        attn = attn * adj
-        attn = attn / (tf.reduce_sum(attn, axis=-1, keepdims=True) + 1e-9)
-
-        return tf.matmul(attn, Wh)
+    def call(self, x, training=False):
+        return self.net(x, training=training)
 
     def get_config(self):
-        return {**super().get_config(), "out_dim": self.out_dim, "dropout_rate": self.dropout_rate}
+        return {
+            **super().get_config(),
+            "dim_hidden": self.dim_hidden,
+            "dropout": self.dropout_rate,
+        }
 
     @classmethod
     def from_config(cls, config):
@@ -84,36 +73,63 @@ class GraphAttentionLayer(tf.keras.layers.Layer):
 
 
 @tf.keras.utils.register_keras_serializable(package="custom")
-class SelfAttentionEncoder(tf.keras.layers.Layer):
-    def __init__(self, dim_in, dim_hidden, dim_proj=64, n_heads=4, dropout=0.1, **kwargs):
+class GraphAttentionLayer(tf.keras.layers.Layer):
+    def __init__(self, out_dim, dropout_rate=0.1, adj_log_alpha=0.5, **kwargs):
         super().__init__(**kwargs)
-        self.dim_in = dim_in
-        self.dim_hidden = dim_hidden
-        self.dim_proj = dim_proj
-        self.n_heads = n_heads
-        self.dropout = dropout
+        self.out_dim = out_dim
+        self.dropout_rate = dropout_rate
+        self.adj_log_alpha = adj_log_alpha
+        self.last_attention = None
 
-        self.proj = layers.Dense(dim_proj)
-        self.attn = layers.MultiHeadAttention(
-            num_heads=n_heads, key_dim=dim_proj // n_heads, dropout=dropout
+    def build(self, input_shape):
+        fin = int(input_shape[-1])
+
+        self.W = self.add_weight(
+            shape=(fin, self.out_dim),
+            initializer="glorot_uniform",
+            trainable=True,
+            name="gat_W",
         )
-        self.norm = layers.LayerNormalization()
-        self.ff = tf.keras.Sequential([layers.Dense(dim_hidden, activation="relu")])
+        self.a_src = self.add_weight(
+            shape=(self.out_dim, 1),
+            initializer="glorot_uniform",
+            trainable=True,
+            name="gat_a_src",
+        )
+        self.a_dst = self.add_weight(
+            shape=(self.out_dim, 1),
+            initializer="glorot_uniform",
+            trainable=True,
+            name="gat_a_dst",
+        )
+        self.leaky_relu = tf.keras.layers.LeakyReLU(negative_slope=0.2)
+        self.dropout = tf.keras.layers.Dropout(self.dropout_rate)
 
-    def call(self, x, training=False):
-        x = tf.expand_dims(self.proj(x), axis=1)  # (B, 1, dim_proj)
-        attn_out = self.attn(x, x, x, training=training)
-        x = self.norm(attn_out)
-        return self.ff(x[:, 0])
+    def call(self, h, adj, training=False):
+        # h: (B, N, F), adj: (B, N, N)
+        Wh = tf.matmul(h, self.W)
+
+        f1 = tf.matmul(Wh, self.a_src)
+        f2 = tf.matmul(Wh, self.a_dst)
+        e = f1 + tf.transpose(f2, perm=[0, 2, 1])
+        e = self.leaky_relu(e)
+
+        eps = 1e-6
+        adj_safe = tf.clip_by_value(adj, eps, 1.0)
+        e = e + self.adj_log_alpha * tf.math.log(adj_safe)
+
+        attn = tf.nn.softmax(e, axis=-1)
+        attn = self.dropout(attn, training=training)
+        self.last_attention = attn
+
+        return tf.matmul(attn, Wh)
 
     def get_config(self):
         return {
             **super().get_config(),
-            "dim_in": self.dim_in,
-            "dim_hidden": self.dim_hidden,
-            "dim_proj": self.dim_proj,
-            "n_heads": self.n_heads,
-            "dropout": self.dropout,
+            "out_dim": self.out_dim,
+            "dropout_rate": self.dropout_rate,
+            "adj_log_alpha": self.adj_log_alpha,
         }
 
     @classmethod
@@ -123,39 +139,79 @@ class SelfAttentionEncoder(tf.keras.layers.Layer):
 
 @tf.keras.utils.register_keras_serializable(package="custom")
 class HeteroGNN(tf.keras.Model):
-    def __init__(self, num_p, num_v, num_s, num_e, dim_hidden=64, ff_dim=128, dropout=0.1, **kwargs):
+    def __init__(
+        self,
+        num_p,
+        num_v,
+        num_s,
+        num_e,
+        dim_hidden=64,
+        ff_dim=128,
+        dropout=0.1,
+        adj_lr_mult=5,
+        adj_lr=1e-2,
+        tau=0.7,
+        alpha=0.5,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
 
-        self._init_kwargs = dict(
-            num_p=num_p,
-            num_v=num_v,
-            num_s=num_s,
-            num_e=num_e,
-            dim_hidden=dim_hidden,
-            ff_dim=ff_dim,
-            dropout=dropout,
+        self._init_kwargs = {
+            "num_p": num_p,
+            "num_v": num_v,
+            "num_s": num_s,
+            "num_e": num_e,
+            "dim_hidden": dim_hidden,
+            "ff_dim": ff_dim,
+            "dropout": dropout,
+            "adj_lr_mult": adj_lr_mult,
+            "adj_lr": adj_lr,
+            "tau": tau,
+            "alpha": alpha,
+        }
+
+        self.adj_scale = tf.Variable(
+            1.0,
+            trainable=False,
+            dtype=tf.float32,
+            name="adj_scale",
         )
 
-        self.encoder_p = SelfAttentionEncoder(num_p, dim_hidden, dropout=dropout)
-        self.encoder_v = SelfAttentionEncoder(num_v, dim_hidden, dropout=dropout)
-        self.encoder_s = SelfAttentionEncoder(num_s, dim_hidden, dropout=dropout)
-        self.encoder_e = SelfAttentionEncoder(num_e, dim_hidden, dropout=dropout)
+        self.encoder_p = GroupDenseEncoder(dim_hidden=dim_hidden, dropout=dropout)
+        self.encoder_v = GroupDenseEncoder(dim_hidden=dim_hidden, dropout=dropout)
+        self.encoder_s = GroupDenseEncoder(dim_hidden=dim_hidden, dropout=dropout)
+        self.encoder_e = GroupDenseEncoder(dim_hidden=dim_hidden, dropout=dropout)
 
-        self.gat = GraphAttentionLayer(out_dim=dim_hidden, dropout_rate=dropout)
+        self.adj_lr_mult = adj_lr_mult
+        self.adj_lr = adj_lr
+        self.tau = tf.constant(tau, dtype=tf.float32)
+        self.alpha = alpha
+
+        self.U = self.add_weight(
+            shape=(4, 2),
+            initializer="glorot_uniform",
+            trainable=True,
+            name="adj_U",
+        )
+
+        self.gnn_norm = layers.LayerNormalization(epsilon=1e-6)
+        self.gat = GraphAttentionLayer(
+            out_dim=dim_hidden,
+            dropout_rate=dropout,
+            adj_log_alpha=alpha,
+        )
+
+        self.pool_score = layers.Dense(1, name="node_pool_score")
+        self.last_pool_alpha = None
 
         self.mlp = tf.keras.Sequential(
             [
-                layers.Input(shape=(dim_hidden * 4,)),
+                layers.Input(shape=(dim_hidden,)),
                 layers.Dropout(dropout),
                 layers.Dense(ff_dim, activation="relu"),
                 layers.Dropout(dropout),
                 layers.Dense(1),
             ]
-        )
-
-        # Learnable adjacency logits (4 nodes)
-        self.A_logits = self.add_weight(
-            shape=(4, 4), initializer="glorot_uniform", trainable=True, name="adj_logits"
         )
 
     def call(self, inputs, training=False):
@@ -166,161 +222,199 @@ class HeteroGNN(tf.keras.Model):
         h_s = self.encoder_s(x_s, training=training)
         h_e = self.encoder_e(x_e, training=training)
 
-        # 4-node graph: [physchem, vehicle, skin, experiment]
-        h_nodes = tf.stack([h_p, h_v, h_s, h_e], axis=1)  # (B, 4, dim_hidden)
+        h_nodes = tf.stack([h_p, h_v, h_s, h_e], axis=1)
 
-        # symmetric adjacency + small diagonal
-        A_prob = tf.sigmoid(self.A_logits)
+        tau = tf.maximum(self.tau, 1e-6)
+        A_logits = tf.matmul(self.U, self.U, transpose_b=True)
+        A_prob = tf.sigmoid(A_logits / tau)
         A_sym = 0.5 * (A_prob + tf.transpose(A_prob))
-        I = tf.eye(4, dtype=A_sym.dtype)
-        A_sym = A_sym * (1.0 - I) + 1e-3 * I
+        A_sym = A_sym * (1.0 - tf.eye(4))
 
-        B = tf.shape(h_nodes)[0]
-        adj_batch = tf.broadcast_to(A_sym, (B, 4, 4))
+        adj_batch = tf.broadcast_to(A_sym, (tf.shape(h_nodes)[0], 4, 4))
 
-        h_gnn = self.gat((h_nodes, adj_batch), training=training)
-        h_flat = tf.reshape(h_gnn, (B, -1))
-        return self.mlp(h_flat)[:, 0]
+        h_gnn = self.gat(h_nodes, adj_batch, training=training)
+
+        score = self.pool_score(h_gnn)
+        alpha = tf.nn.softmax(score, axis=1)
+        self.last_pool_alpha = alpha
+
+        h_pool = tf.reduce_sum(alpha * h_gnn, axis=1)
+
+        return self.mlp(h_pool, training=training)[:, 0]
 
     def get_config(self):
         return {**super().get_config(), **self._init_kwargs}
 
     @classmethod
     def from_config(cls, config):
-        return cls(**config)
+        return cls(
+            num_p=config.pop("num_p"),
+            num_v=config.pop("num_v"),
+            num_s=config.pop("num_s"),
+            num_e=config.pop("num_e"),
+            dim_hidden=config.pop("dim_hidden"),
+            ff_dim=config.pop("ff_dim"),
+            dropout=config.pop("dropout"),
+            adj_lr_mult=config.pop("adj_lr_mult", 5),
+            adj_lr=config.pop("adj_lr", 1e-2),
+            tau=config.pop("tau", 0.7),
+            alpha=config.pop("alpha", 0.5),
+            **config,
+        )
 
 
-# =========================================
-# Config: file paths & category mapping
-# =========================================
-DEFAULT_MODEL_PATH = "revised_GAT_model_fold1.keras"     # included in repo
-DEFAULT_SCALER_PATH = "scaler_params.json"               # included in repo (JSON or joblib)
+# =====================================================
+# Config
+# =====================================================
+DEFAULT_MODEL_PATH = "2026_GAT_model_fold1_rev_v2.keras"
+MODEL_PATH_FALLBACK = os.path.join("model weight", "2026_GAT_model_fold1_rev_v2.keras")
 
-# Category label mappings (MUST match training LabelEncoder outputs)
-LABEL_MAPS = {
-    "Skin Type": {"human": 1, "pig": 2, "rat": 3, "guineapig": 4, "mouse": 5, "rabbit": 6},
-    "Vcl_LP": {"hydrophilic": 0, "lipophilic": 1},
-    "Corrosive_Irritation_score": {"Negative": 0, "Positive": 1},
-    "Emulsifier": {"Not Include Emulsifier": 0, "Include Emulsifier": 1},
+DEFAULT_SCALER_PATH = "scaler_params.json"
+PROCESSED_XLSX = "processed_test_target.xlsx"
+OUTLIERS_XLSX = "outliers.xlsx"
+
+CUSTOM_OBJECTS = {
+    "HeteroGNN": HeteroGNN,
+    "GroupDenseEncoder": GroupDenseEncoder,
+    "GraphAttentionLayer": GraphAttentionLayer,
 }
 
-# Default categories when missing / not selected
+# Feature order must match training.
+PHY_CHEM = [
+    "scaled_Molecular Weight",
+    "scaled_LogKow",
+    "scaled_TPSA",
+    "scaled_Water Solubility",
+    "scaled_Melting Point",
+    "scaled_Boiling Point",
+    "scaled_Vapor Pressure",
+    "scaled_Density",
+    "Corrosive_Irritation_score",
+]
+
+VEHICLE = [
+    "Emulsifier",
+    "scaled_Enhancer_logKow",
+    "scaled_Enhancer_vap",
+    "Enhancer_ratio",
+]
+
+SKIN = [
+    "Skin Type",
+    "skin_thickness_cat",
+    "skin_site_code",
+]
+
+EXPER = [
+    "Conc",
+    "scaled_Appl_area",
+    "time",
+]
+
+RAW_FOR_SCALING = [
+    "Molecular Weight",
+    "LogKow",
+    "Melting Point",
+    "Boiling Point",
+    "Vapor Pressure",
+    "Density",
+    "Water Solubility",
+    "Enhancer_logKow",
+    "Enhancer_vap",
+    "TPSA",
+    "Appl_area",
+    "Exposure Time",
+    "time",
+    "SlogP_VSA5",
+    "VSA_EState8",
+    "SMR_VSA5",
+    "Chi2n",
+    "Chi2v",
+]
+
+RAW_EXTRAS = [
+    "Init_Load_Area",
+    "Vehicle Load",
+    "Enhancer_ratio",
+]
+
+CATS = [
+    "Skin Type",
+    "skin_thickness_cat",
+    "skin_site_code",
+    "Corrosive_Irritation_score",
+    "Emulsifier",
+]
+
+LABEL_MAPS = {
+    "Skin Type": {
+        "human": 1,
+        "pig": 2,
+        "rat": 3,
+        "guineapig": 4,
+        "mouse": 5,
+        "rabbit": 6,
+    },
+    "skin_thickness_cat": {
+        "thin": 0,
+        "medium": 1,
+        "thick": 2,
+    },
+    "skin_site_code": {
+        "ears": 0,
+        "forearm": 1,
+        "breast": 2,
+        "abdominal": 3,
+        "dorsal": 4,
+    },
+    "Corrosive_Irritation_score": {
+        "Negative": 0,
+        "Positive": 1,
+    },
+    "Emulsifier": {
+        "Not Include Emulsifier": 0,
+        "Include Emulsifier": 1,
+    },
+}
+
 DEFAULT_LABELS = {
     "Skin Type": "human",
-    "Vcl_LP": "lipophilic",
+    "skin_thickness_cat": "medium",
+    "skin_site_code": "dorsal",
     "Corrosive_Irritation_score": "Positive",
     "Emulsifier": "Include Emulsifier",
 }
 
-# Chemical DB (Excel) included in repo
-PROCESSED_XLSX = "processed_test_target.xlsx"
-
-
-@st.cache_resource
-def load_chemical_db(path: str):
-    """Load chemical database from xlsx (requires openpyxl in requirements)."""
-    if not os.path.exists(path):
-        st.warning(f"Chemical DB file not found: {path}")
-        return None
-    try:
-        return pd.read_excel(path)
-    except Exception as e:
-        st.error(f"Failed to load xlsx: {e}")
-        return None
-
-
-# =========================================
-# Utilities to load model & scaler (no upload)
-# =========================================
-CUSTOM_OBJECTS = {
-    "HeteroGNN": HeteroGNN,
-    "SelfAttentionEncoder": SelfAttentionEncoder,
-    "GraphAttentionLayer": GraphAttentionLayer,
+DISPLAY_NAME = {
+    "Init_Load_Area": "Active Ingredient Load per Area",
+    "Vehicle Load": "Vehicle Load per Area",
+    "skin_thickness_cat": "Skin Thickness Category",
+    "skin_site_code": "Skin Site",
 }
 
+UNITS = {
+    "Molecular Weight": "g/mol",
+    "LogKow": "-",
+    "TPSA": "A^2",
+    "Water Solubility": "mg/L, raw input",
+    "Vapor Pressure": "mmHg, raw input",
+    "Melting Point": "deg C",
+    "Boiling Point": "deg C",
+    "Density": "g/mL",
+    "Enhancer_logKow": "-",
+    "Enhancer_vap": "Pa, raw input",
+    "Appl_area": "cm2",
+    "Exposure Time": "h",
+    "Init_Load_Area": "ug/cm2",
+    "Vehicle Load": "ug",
+    "Enhancer_ratio": "0-1",
+    "SlogP_VSA5": "-",
+    "VSA_EState8": "-",
+    "SMR_VSA5": "-",
+    "Chi2n": "-",
+    "Chi2v": "-",
+}
 
-@st.cache_resource
-def load_model_from_disk(path: str):
-    """Load the saved Keras model from disk with custom objects."""
-    if not os.path.exists(path):
-        st.error(f"Model file not found: {path}")
-        st.stop()
-    try:
-        return tf.keras.models.load_model(
-            path,
-            custom_objects=CUSTOM_OBJECTS,
-            compile=False,
-            safe_mode=False,  # required for custom code execution in Keras3
-        )
-    except Exception as e:
-        st.error(f"Failed to load model: {e}")
-        st.stop()
-
-
-@st.cache_resource
-def load_scaler_params_from_disk(path: str):
-    """
-    Load scaler parameters for feature standardization.
-
-    Supported formats:
-    1) joblib/pkl bundle: {"scaler": StandardScaler, "cols": [...]}
-    2) json (orient='table') or dict: {feature: {"mean":..., "std":...}, ...}
-    Returns a DataFrame indexed by feature with columns [mean, std].
-    """
-    if not os.path.exists(path):
-        st.error(f"Scaler parameter file not found: {path}")
-        st.stop()
-
-    # joblib bundle support
-    if path.endswith(".joblib") or path.endswith(".pkl"):
-        bundle = joblib.load(path)
-        if isinstance(bundle, dict) and "scaler" in bundle and "cols" in bundle:
-            scaler = bundle["scaler"]
-            cols = bundle["cols"]
-            df = pd.DataFrame({"mean": scaler.mean_, "std": scaler.scale_}, index=cols)
-            return df[["mean", "std"]]
-        st.error('joblib file must be a dict: {"scaler": StandardScaler, "cols": [...]}')
-        st.stop()
-
-    # JSON support
-    with open(path, "rb") as f:
-        content = f.read()
-
-    try:
-        obj = json.loads(content)
-        if isinstance(obj, dict) and "schema" in obj and "data" in obj:
-            df = pd.read_json(io.BytesIO(content), orient="table")
-            if "feature" in df.columns:
-                df = df.set_index("feature")
-            return df[["mean", "std"]]
-        elif isinstance(obj, dict):
-            rows = []
-            for k, v in obj.items():
-                rows.append({"feature": k, "mean": v.get("mean", 0.0), "std": v.get("std", 1.0)})
-            df = pd.DataFrame(rows).set_index("feature")
-            return df[["mean", "std"]]
-    except Exception:
-        pass
-
-    st.error("Unsupported scaler parameter format. Use JSON (param_df) or a joblib bundle.")
-    st.stop()
-
-
-def standardize_from_params(raw_dict, params_df):
-    """Standardize raw feature values using precomputed mean/std."""
-    out = {}
-    for feat, row in params_df.iterrows():
-        mean = float(row["mean"])
-        std = float(row["std"]) if row["std"] != 0 else 1e-9
-        x = float(raw_dict.get(feat, 0.0))
-        out[f"scaled_{feat}"] = (x - mean) / std
-    return out
-
-
-# =========================================
-# Outlier clipping
-# =========================================
-OUTLIERS_XLSX = "outliers.xlsx"
 CLIP_COLS = [
     "Molecular Weight",
     "Density",
@@ -331,22 +425,118 @@ CLIP_COLS = [
 ]
 
 
+# =====================================================
+# Cache loaders
+# =====================================================
+@st.cache_resource
+def load_chemical_db(path: str):
+    if not os.path.exists(path):
+        st.warning(f"Chemical DB file not found: {path}")
+        return None
+    try:
+        return pd.read_excel(path)
+    except Exception as e:
+        st.error(f"Failed to load xlsx: {e}")
+        return None
+
+
+@st.cache_resource
+def load_model_from_disk(path: str):
+    model_path = path
+    if not os.path.exists(model_path) and os.path.exists(MODEL_PATH_FALLBACK):
+        model_path = MODEL_PATH_FALLBACK
+
+    if not os.path.exists(model_path):
+        st.error(
+            "Model file not found. Put 2026_GAT_model_fold1_rev_v2.keras "
+            "in the working directory or in ./model weight/."
+        )
+        st.stop()
+
+    try:
+        return tf.keras.models.load_model(
+            model_path,
+            custom_objects=CUSTOM_OBJECTS,
+            compile=False,
+            safe_mode=False,
+        )
+    except Exception as e:
+        st.error(f"Failed to load model: {e}")
+        st.stop()
+
+
+@st.cache_resource
+def load_scaler_params_from_disk(path: str):
+    """
+    Supported formats:
+      1) joblib/pkl bundle: {"scaler": StandardScaler, "cols": [...]}
+      2) JSON table or dict: {feature: {"mean": ..., "std": ...}, ...}
+    Returns DataFrame indexed by feature with columns [mean, std].
+    """
+    if not os.path.exists(path):
+        # Try common alternatives.
+        for alt in ["scaler_params.joblib", "scaler_params.pkl"]:
+            if os.path.exists(alt):
+                path = alt
+                break
+
+    if not os.path.exists(path):
+        st.error(
+            "Scaler parameter file not found. Provide scaler_params.json, "
+            "scaler_params.joblib, or scaler_params.pkl."
+        )
+        st.stop()
+
+    if path.endswith(".joblib") or path.endswith(".pkl"):
+        bundle = joblib.load(path)
+        if isinstance(bundle, dict) and "scaler" in bundle and "cols" in bundle:
+            scaler = bundle["scaler"]
+            cols = bundle["cols"]
+            df = pd.DataFrame(
+                {"mean": scaler.mean_, "std": scaler.scale_},
+                index=cols,
+            )
+            return df[["mean", "std"]]
+
+        st.error('joblib/pkl file must be a dict: {"scaler": StandardScaler, "cols": [...]}')
+        st.stop()
+
+    with open(path, "rb") as f:
+        content = f.read()
+
+    try:
+        obj = json.loads(content)
+        if isinstance(obj, dict) and "schema" in obj and "data" in obj:
+            df = pd.read_json(io.BytesIO(content), orient="table")
+            if "feature" in df.columns:
+                df = df.set_index("feature")
+            return df[["mean", "std"]]
+
+        if isinstance(obj, dict):
+            rows = []
+            for k, v in obj.items():
+                rows.append(
+                    {
+                        "feature": k,
+                        "mean": v.get("mean", 0.0),
+                        "std": v.get("std", 1.0),
+                    }
+                )
+            df = pd.DataFrame(rows).set_index("feature")
+            return df[["mean", "std"]]
+    except Exception:
+        pass
+
+    st.error("Unsupported scaler parameter format.")
+    st.stop()
+
+
 @st.cache_resource
 def load_outlier_limits(path: str, clip_cols=None):
     """
-    Supports two formats:
-
-    New format:
-      - single sheet (default first sheet)
-      - row 0: upper bounds, row 1: lower bounds
-      - columns: feature names
-
-    Legacy format (backward compatible):
-      - sheets named 'upper' and 'lower'
-      - first row contains values
-
-    Returns:
-      dict { feature: (lower, upper) }
+    Supports:
+      - first sheet, row 0 upper bounds, row 1 lower bounds
+      - legacy sheets named upper/lower
     """
     if not os.path.exists(path):
         st.warning(f"Outlier file not found: {path}")
@@ -361,7 +551,6 @@ def load_outlier_limits(path: str, clip_cols=None):
         return df
 
     try:
-        # 1) new format (single sheet, row 0 upper / row 1 lower)
         df = _clean(pd.read_excel(path))
         if clip_cols:
             keep = [c for c in df.columns if c in clip_cols]
@@ -381,7 +570,6 @@ def load_outlier_limits(path: str, clip_cols=None):
             if any(v is not None for pair in limits.values() for v in pair):
                 return limits
 
-        # 2) legacy format (upper/lower sheets)
         xls = pd.ExcelFile(path)
         if {"upper", "lower"}.issubset(set(xls.sheet_names)):
             df_u = _clean(pd.read_excel(xls, sheet_name="upper"))
@@ -410,23 +598,116 @@ def load_outlier_limits(path: str, clip_cols=None):
         return {}
 
 
+# =====================================================
+# Utility functions
+# =====================================================
+def build_label(feat: str) -> str:
+    base = DISPLAY_NAME.get(feat, feat)
+    unit = UNITS.get(feat)
+    return f"{base} ({unit})" if unit else base
+
+
 def clip_with_limits(feat: str, val: float, limits: dict):
-    """Clip a value using (lower, upper) bounds from limits dict."""
     if feat not in limits:
         return val, None
+
     lo, hi = limits[feat]
     clipped = val
+
     if lo is not None:
         clipped = max(clipped, lo)
     if hi is not None:
         clipped = min(clipped, hi)
-    changed = (clipped != val)
+
+    changed = clipped != val
     return clipped, (lo, hi) if changed else None
 
 
-# =========================================
-# Skin thickness rules/options
-# =========================================
+def standardize_from_params(raw_dict, params_df):
+    out = {}
+    for feat, row in params_df.iterrows():
+        mean = float(row["mean"])
+        std = float(row["std"]) if float(row["std"]) != 0 else 1e-9
+        x = float(raw_dict.get(feat, 0.0))
+        out[f"scaled_{feat}"] = (x - mean) / std
+    return out
+
+
+def exposure_to_time_cat(exposure_time):
+    exposure_time = float(exposure_time)
+    if exposure_time <= 1:
+        return 0
+    if exposure_time <= 12:
+        return 1
+    if exposure_time <= 24:
+        return 2
+    return 3
+
+
+def skin_site_to_code(site_label):
+    return LABEL_MAPS["skin_site_code"].get(str(site_label).strip().lower(), 4)
+
+
+def infer_skin_thickness_cat(thickness_um):
+    """
+    The training code used skin_thickness_cat, but the exact bin rule is not
+    visible in this app file. For safety, the app asks the user to select the
+    category directly. This helper is only used if the optional auto mode is selected.
+    """
+    try:
+        x = float(thickness_um)
+    except Exception:
+        return 1
+
+    # Conservative default bins. Adjust these if you have the original bin rule.
+    if x < 100:
+        return 0
+    if x < 1000:
+        return 1
+    return 2
+
+
+def apply_training_transforms(raw):
+    """
+    Match training-time preprocessing:
+      - log-transform Water Solubility and Vapor Pressure
+      - build time category from Exposure Time
+    """
+    raw = raw.copy()
+
+    ws = float(raw.get("Water Solubility", 0.0))
+    vp = float(raw.get("Vapor Pressure", 0.0))
+
+    raw["Water Solubility"] = np.round(np.log(ws + 1e-5), 3)
+    raw["Vapor Pressure"] = np.round(np.log(vp + 1e-5), 3)
+    raw["time"] = exposure_to_time_cat(raw.get("Exposure Time", 0.0))
+
+    return raw
+
+
+def active_load_area_to_conc(init_load_area, appl_area, vehicle_load):
+    """
+    Training code:
+      Conc = Active Load / Vehicle Load * 100
+    If user enters Init_Load_Area in ug/cm2 and Appl_area in cm2:
+      Active Load = Init_Load_Area * Appl_area
+    Vehicle Load is expected in ug.
+    """
+    active_load = float(init_load_area) * float(appl_area)
+    vehicle_load = max(float(vehicle_load), 1e-9)
+    return active_load / vehicle_load * 100.0
+
+
+def get_numeric_from_row(row, feat, default=None):
+    if feat not in row or pd.isna(row[feat]):
+        return default
+    try:
+        return float(row[feat])
+    except Exception:
+        return default
+
+
+# Optional skin thickness lookup used only for user convenience.
 SKIN_SITE_CANON = {
     "rat": ["abdominal", "dorsal"],
     "human": [
@@ -441,7 +722,7 @@ SKIN_SITE_CANON = {
     "pig": ["dorsal", "ears"],
     "guineapig": ["dorsal"],
     "rabbit": ["dorsal"],
-    "mouse": ["dorsal"],  # no rule -> no default
+    "mouse": ["dorsal"],
 }
 
 SKIN_THICKNESS_RULES = {
@@ -474,29 +755,24 @@ SKIN_THICKNESS_RULES = {
 }
 
 
-def _norm_site(site: str | None) -> str:
-    """Normalize site string to match preprocessing: strip, lowercase."""
-    return (site or "").strip().lower()
-
-
-def infer_skin_thickness(skin_type_label: str, skin_site: str | None, layer: str | None) -> float | None:
-    """Infer skin thickness (µm) using (Skin Type label, site, layer). Returns None if no rule exists."""
+def infer_skin_thickness(skin_type_label, skin_site, layer):
     stype = (skin_type_label or "").strip().lower()
-    site = _norm_site(skin_site)
+    site = (skin_site or "dorsal").strip().lower()
     lyr = (layer or "whole").strip().lower()
     if lyr not in ("whole", "epidermis"):
         lyr = "whole"
-    if not site:
-        site = "dorsal"
     return SKIN_THICKNESS_RULES.get((stype, site, lyr))
 
 
-# =========================================
+# =====================================================
 # App
-# =========================================
-st.set_page_config(page_title="Dermal Absorption Rate(%) Prediction", page_icon="🧪", layout="centered")
+# =====================================================
+st.set_page_config(
+    page_title="Dermal Absorption Rate(%) Prediction",
+    page_icon="🧪",
+    layout="centered",
+)
 
-# Initialize session storage
 if "raw_defaults" not in st.session_state:
     st.session_state.raw_defaults = {}
 if "cat_defaults" not in st.session_state:
@@ -506,94 +782,29 @@ st.title("DermGAT Dermal Absorption Prediction (Im et al., 2026)")
 
 st.markdown(
     """
-**Model Notes**  
-This model predicts dermal absorption rate (%) under a reference active ingredient
-dose of **100 µg/cm²**. If your active ingredient dose differs substantially from
-this reference, predictions may be less reliable.  
-Please enter **test conditions** and **chemical properties** below.
+**Model Notes**
+
+This app uses the best model: **2026_GAT_model_fold1_rev_v2.keras**.
+
+The output is the predicted **MM-converted dermal absorption (%)**
+at the reference active ingredient dose of **100 ug/cm2**.
 """
 )
 
-# Auto-load from fixed paths (no upload)
 model = load_model_from_disk(DEFAULT_MODEL_PATH)
 params_df = load_scaler_params_from_disk(DEFAULT_SCALER_PATH)
+OUTLIER_LIMITS = load_outlier_limits(OUTLIERS_XLSX, clip_cols=CLIP_COLS)
 
-st.sidebar.success("Model/Scaler: auto-loaded from repo files")
+st.sidebar.success("Best DermGAT model and scaler loaded")
 output_raw_scale = st.sidebar.checkbox("Convert output back to original scale (expm1)", value=True)
-
-PHY_CHEM = [
-    "scaled_Molecular Weight",
-    "scaled_LogKow",
-    "scaled_TPSA",
-    "scaled_Water Solubility",
-    "scaled_Melting Point",
-    "scaled_Boiling Point",
-    "scaled_Vapor Pressure",
-    "scaled_Density",
-    "Corrosive_Irritation_score",
-]
-VEHICLE = ["Vcl_LP", "Emulsifier", "scaled_Enhancer_logKow", "scaled_Enhancer_vap", "Enhancer_ratio"]
-SKIN = ["Skin Type", "scaled_Skin Thickness"]
-EXPER = ["Conc", "scaled_Appl_area", "scaled_Exposure Time"]
-
-RAW_FOR_SCALING = [
-    "Molecular Weight",
-    "LogKow",
-    "TPSA",
-    "Water Solubility",
-    "Melting Point",
-    "Boiling Point",
-    "Vapor Pressure",
-    "Density",
-    "Skin Thickness",
-    "Enhancer_logKow",
-    "Enhancer_vap",
-    "Appl_area",
-    "Exposure Time",
-]
-RAW_EXTRAS = ["Init_Load_Area", "Vehicle Load", "Enhancer_ratio"]
-CATS = ["Skin Type", "Vcl_LP", "Corrosive_Irritation_score", "Emulsifier"]
-
-# Columns to display in log form (internal key -> UI label)
-LOG_DISPLAY = {
-    "Water Solubility": "log(Water Solubility)",
-    "Vapor Pressure": "log(Vapor Pressure)",
-}
-
-DISPLAY_NAME = {
-    "Init_Load_Area": "Active Ingredient Load per Area",
-    "Vehicle Load": "Vehicle Load per Area",
-}
-
-# Units (edit as needed)
-UNITS = {
-    "Molecular Weight": "g/mol",
-    "LogKow": "-",
-    "TPSA": "Å²",
-    "Water Solubility": "log(mg/L)",
-    "Vapor Pressure": "log(mmHg)",
-    "Melting Point": "°C",
-    "Boiling Point": "°C",
-    "Density": "g/mL (at 20°C or 25°C)",
-    "Skin Thickness": "µm",
-    "Enhancer_logKow": "-",
-    "Enhancer_vap": "log(Pa)",
-    "Appl_area": "cm²",
-    "Exposure Time": "h",
-    "Init_Load_Area": "µg/cm²",
-    "Vehicle Load": "µg/cm²",
-    "Enhancer_ratio": "0~1",
-}
+show_debug = st.sidebar.checkbox("Show debug information", value=False)
 
 
-def build_label(feat: str) -> str:
-    """Convert internal feature name to UI label (log label + unit)."""
-    base = LOG_DISPLAY.get(feat, DISPLAY_NAME.get(feat, feat))
-    unit = UNITS.get(feat)
-    return f"{base} ({unit})" if unit else base
-
-
+# =====================================================
+# Chemical Search
+# =====================================================
 st.header("1) Chemical Search")
+
 q_col1, q_col2 = st.columns([2, 1])
 with q_col1:
     q_name = st.text_input("Chemical Name (exact match, case-insensitive)", "")
@@ -606,19 +817,22 @@ if st.button("Search"):
         st.info("Chemical DB is empty or failed to load.")
     else:
         if not {"name", "cas"}.issubset(set(df.columns)):
-            st.error("The Excel file must contain 'name' and 'cas' columns.")
+            st.error("The Excel file must contain name and cas columns.")
         else:
             df2 = df.copy()
 
             mask = pd.Series(True, index=df2.index)
             if q_name.strip():
                 mask &= df2["name"].astype(str).str.strip().str.lower() == q_name.strip().lower()
+
             if q_cas.strip():
-                def norm(s):  # normalize by removing hyphens
+                def norm_cas(s):
                     return str(s).replace("-", "").strip()
-                mask &= df2["cas"].astype(str).map(norm) == norm(q_cas)
+
+                mask &= df2["cas"].astype(str).map(norm_cas) == norm_cas(q_cas)
 
             hits = df2[mask]
+
             if hits.empty:
                 st.warning("No matching entry found.")
             else:
@@ -626,7 +840,7 @@ if st.button("Search"):
                 st.success("Match found. Values were injected into the form.")
                 st.dataframe(hits.head(5))
 
-                # Inject numeric defaults
+                # Numeric defaults.
                 for feat in [
                     "Molecular Weight",
                     "LogKow",
@@ -636,18 +850,25 @@ if st.button("Search"):
                     "Boiling Point",
                     "Vapor Pressure",
                     "Density",
+                    "SlogP_VSA5",
+                    "VSA_EState8",
+                    "SMR_VSA5",
+                    "Chi2n",
+                    "Chi2v",
                 ]:
-                    if feat in row and pd.notna(row[feat]):
-                        try:
-                            st.session_state.raw_defaults[feat] = float(row[feat])
-                        except Exception:
-                            pass
+                    val = get_numeric_from_row(row, feat, None)
+                    if val is not None:
+                        st.session_state.raw_defaults[feat] = val
 
-                # Category injection: Corrosive_Irritation_score (text or numeric code)
-                cat = "Corrosive_Irritation_score"
-                if cat in row and pd.notna(row[cat]):
+                # Category defaults from DB if present.
+                for cat in CATS:
+                    if cat not in row or pd.isna(row[cat]):
+                        continue
+
                     val = row[cat]
                     mapping = LABEL_MAPS.get(cat, {})
+                    inv = {v: k for k, v in mapping.items()}
+
                     if isinstance(val, str):
                         label = val.strip()
                         if label in mapping:
@@ -655,23 +876,23 @@ if st.button("Search"):
                     else:
                         try:
                             code = int(val)
-                            inv = {v: k for k, v in mapping.items()}
                             if code in inv:
                                 st.session_state.cat_defaults[cat] = inv[code]
                         except Exception:
                             pass
 
-# Load outlier limits once (cached)
-OUTLIER_LIMITS = load_outlier_limits(OUTLIERS_XLSX)
 
+# =====================================================
+# Inputs
+# =====================================================
 st.header("2) Inputs")
 st.caption(
-    "Inputs are automatically clipped using lower/upper bounds in outliers.xlsx. "
-    "Please input log-values for Water Solubility and Vapor Pressure."
+    "Enter raw Water Solubility and Vapor Pressure. "
+    "The app applies the same log-transform used during training."
 )
 st.caption(
-    "If you do not know Skin Thickness, leave it blank via the 'Auto-infer' option and click Predict. "
-    "The app will infer thickness using skin metadata rules when available."
+    "The model input uses skin_thickness_cat and skin_site_code. "
+    "If you know the exact training category, select it directly."
 )
 
 with st.form("inp"):
@@ -679,112 +900,130 @@ with st.form("inp"):
     raw = {}
     clipped_notes = []
 
-    # --- Skin Thickness entry mode ---
-    mode = st.radio(
-        "Skin Thickness Input Mode",
-        ["Manual entry", "Unknown → auto-infer using rules"],
+    # Optional helper for skin thickness inference; final model uses skin_thickness_cat.
+    st.subheader("Skin metadata")
+
+    stype_choices = list(LABEL_MAPS["Skin Type"].keys())
+    stype_default = st.session_state.cat_defaults.get("Skin Type", DEFAULT_LABELS["Skin Type"])
+    stype_idx = stype_choices.index(stype_default) if stype_default in stype_choices else 0
+    skin_type_label = colA.selectbox("Skin Type", stype_choices, index=stype_idx)
+
+    site_choices = list(LABEL_MAPS["skin_site_code"].keys())
+    site_default = st.session_state.cat_defaults.get("skin_site_code", DEFAULT_LABELS["skin_site_code"])
+    site_idx = site_choices.index(site_default) if site_default in site_choices else site_choices.index("dorsal")
+    skin_site_label = colB.selectbox("Skin Site", site_choices, index=site_idx)
+
+    skin_thick_mode = st.radio(
+        "Skin thickness category input",
+        ["Select category directly", "Infer category from thickness rule"],
         index=0,
         horizontal=True,
     )
 
-    inferred_thick = None
+    inferred_thickness = None
+    inferred_thick_cat_code = None
 
-    if mode.endswith("rules"):
-        stype_choices = list(LABEL_MAPS["Skin Type"].keys())
-        injected = st.session_state.cat_defaults.get("Skin Type")
-        stype_default_label = (
-            injected if injected in stype_choices else DEFAULT_LABELS.get("Skin Type", stype_choices[0])
-        )
-        stype_idx = stype_choices.index(stype_default_label) if stype_default_label in stype_choices else 0
-        sel_skin_type_label = colA.selectbox("Skin Type (for thickness inference)", stype_choices, index=stype_idx)
+    if skin_thick_mode.startswith("Infer"):
+        layer = colA.selectbox("Skin Layer", ["whole", "epidermis"], index=0)
+        inferred_thickness = infer_skin_thickness(skin_type_label, skin_site_label, layer)
+        if inferred_thickness is not None:
+            inferred_thick_cat_code = infer_skin_thickness_cat(inferred_thickness)
+            inv_thick = {v: k for k, v in LABEL_MAPS["skin_thickness_cat"].items()}
+            inferred_thick_label = inv_thick.get(inferred_thick_cat_code, "medium")
+            st.session_state.cat_defaults["skin_thickness_cat"] = inferred_thick_label
+            colB.metric("Inferred Skin Thickness", f"{inferred_thickness:.2f} um")
+            colB.metric("Inferred skin_thickness_cat", inferred_thick_label)
+        else:
+            colB.warning("No skin thickness rule available. Select category directly instead.")
 
-        sel_layer = colB.selectbox("Skin Layer", ["whole", "epidermis"], index=0)
+    st.subheader("Numeric inputs")
 
-        site_opts = SKIN_SITE_CANON.get(sel_skin_type_label, ["dorsal"])
-        sel_site = colA.selectbox(
-            "Skin Site",
-            site_opts,
-            index=(site_opts.index("dorsal") if "dorsal" in site_opts else 0),
-        )
+    # Exclude time from manual entry because time is derived from Exposure Time.
+    manual_numeric = [x for x in RAW_FOR_SCALING if x != "time"] + RAW_EXTRAS
 
-        inferred_thick = infer_skin_thickness(sel_skin_type_label, sel_site, sel_layer)
-
-        # reflect in category defaults for downstream use
-        st.session_state.cat_defaults["Skin Type"] = sel_skin_type_label
-
-        colB.metric(
-            "Inferred Skin Thickness (µm)",
-            f"{inferred_thick:.2f}" if inferred_thick is not None else "No rule available",
-        )
-
-    # --- Numeric inputs ---
-    for i, feat in enumerate(RAW_FOR_SCALING + RAW_EXTRAS):
+    for i, feat in enumerate(manual_numeric):
         container = colA if i % 2 == 0 else colB
-        default_val = float(st.session_state.raw_defaults.get(feat, 0.00))
+        default_val = float(st.session_state.raw_defaults.get(feat, 0.0))
 
-        if feat == "Skin Thickness" and inferred_thick is not None:
+        val = float(
             container.number_input(
                 build_label(feat),
-                value=round(inferred_thick, 2),
+                value=round(default_val, 4),
                 step=0.01,
-                format="%.2f",
-                disabled=True,
+                format="%.4f",
             )
-            val = float(inferred_thick)
-        else:
-            val = float(
-                container.number_input(
-                    build_label(feat),
-                    value=round(default_val, 2),
-                    step=0.01,
-                    format="%.2f",
-                )
-            )
+        )
 
-        # clip using outlier bounds
+        # Clip using outlier bounds before log-transform, same as original app behavior.
         if feat in CLIP_COLS and OUTLIER_LIMITS:
             val_after, lim = clip_with_limits(feat, val, OUTLIER_LIMITS)
             if lim is not None:
                 clipped_notes.append(
-                    f"{feat}: {val:.2f} → {val_after:.2f} (bounds {lim[0]} ~ {lim[1]})"
+                    f"{feat}: {val:.4f} -> {val_after:.4f} "
+                    f"(bounds {lim[0]} ~ {lim[1]})"
                 )
             val = val_after
 
         raw[feat] = val
 
-    # --- Categorical inputs ---
+    st.subheader("Categorical inputs")
+
     cat_vals = {}
-    for c in CATS:
-        mapping = LABEL_MAPS.get(c)
 
-        # if thickness is auto-inferred, hide Skin Type select and lock it
-        if c == "Skin Type" and mode.endswith("rules"):
-            cat_vals[c] = int(LABEL_MAPS[c][st.session_state.cat_defaults["Skin Type"]])
-            continue
+    # Skin Type and Skin Site already selected above.
+    cat_vals["Skin Type"] = int(LABEL_MAPS["Skin Type"][skin_type_label])
+    cat_vals["skin_site_code"] = int(LABEL_MAPS["skin_site_code"][skin_site_label])
 
-        if mapping is None:
-            cat_vals[c] = int(st.number_input(f"{c} (integer code)", value=0, step=1))
-        else:
-            choices = list(mapping.keys())
-            injected = st.session_state.cat_defaults.get(c)
-            default_label = injected if injected in choices else DEFAULT_LABELS.get(c, choices[0])
-            default_idx = choices.index(default_label) if default_label in choices else 0
-            sel = st.selectbox(c, choices, index=default_idx)
-            cat_vals[c] = int(mapping[sel])
+    # Skin thickness category.
+    thick_choices = list(LABEL_MAPS["skin_thickness_cat"].keys())
+    thick_default = st.session_state.cat_defaults.get(
+        "skin_thickness_cat",
+        DEFAULT_LABELS["skin_thickness_cat"],
+    )
+    thick_idx = thick_choices.index(thick_default) if thick_default in thick_choices else 1
+
+    thick_label = st.selectbox(
+        "Skin Thickness Category",
+        thick_choices,
+        index=thick_idx,
+    )
+    cat_vals["skin_thickness_cat"] = int(LABEL_MAPS["skin_thickness_cat"][thick_label])
+
+    # Remaining categories.
+    for c in ["Corrosive_Irritation_score", "Emulsifier"]:
+        choices = list(LABEL_MAPS[c].keys())
+        default_label = st.session_state.cat_defaults.get(c, DEFAULT_LABELS[c])
+        default_idx = choices.index(default_label) if default_label in choices else 0
+        sel = st.selectbox(c, choices, index=default_idx)
+        cat_vals[c] = int(LABEL_MAPS[c][sel])
 
     submitted = st.form_submit_button("Predict")
 
-# --- After submit ---
+
+# =====================================================
+# Prediction
+# =====================================================
 if submitted:
     if clipped_notes:
         with st.expander("Clipping log"):
             for note in clipped_notes:
                 st.write("- " + note)
 
-    # conc definition used during training (keep identical)
-    conc = (raw.get("Init_Load_Area", 0.0) * raw.get("Appl_area", 0.0)) / max(raw.get("Vehicle Load", 1e-9), 1e-9)
+    raw_model = apply_training_transforms(raw)
 
-    scaled = standardize_from_params(raw, params_df)
+    conc = active_load_area_to_conc(
+        init_load_area=raw_model.get("Init_Load_Area", 0.0),
+        appl_area=raw_model.get("Appl_area", 0.0),
+        vehicle_load=raw_model.get("Vehicle Load", 1e-9),
+    )
+    raw_model["Conc"] = conc
+
+    # Ensure all scaler columns are present.
+    for feat in params_df.index:
+        if feat not in raw_model:
+            raw_model[feat] = 0.0
+
+    scaled = standardize_from_params(raw_model, params_df)
 
     x_p = [
         scaled.get("scaled_Molecular Weight", 0.0),
@@ -797,41 +1036,57 @@ if submitted:
         scaled.get("scaled_Density", 0.0),
         float(cat_vals["Corrosive_Irritation_score"]),
     ]
+
     x_v = [
-        float(cat_vals["Vcl_LP"]),
         float(cat_vals["Emulsifier"]),
         scaled.get("scaled_Enhancer_logKow", 0.0),
         scaled.get("scaled_Enhancer_vap", 0.0),
-        float(raw.get("Enhancer_ratio", 0.0)),
+        float(raw_model.get("Enhancer_ratio", 0.0)),
     ]
-    x_s = [float(cat_vals["Skin Type"]), scaled.get("scaled_Skin Thickness", 0.0)]
-    x_e = [float(conc), scaled.get("scaled_Appl_area", 0.0), scaled.get("scaled_Exposure Time", 0.0)]
+
+    x_s = [
+        float(cat_vals["Skin Type"]),
+        float(cat_vals["skin_thickness_cat"]),
+        float(cat_vals["skin_site_code"]),
+    ]
+
+    x_e = [
+        float(raw_model["Conc"]),
+        scaled.get("scaled_Appl_area", 0.0),
+        float(raw_model["time"]),
+    ]
 
     Xp = np.array([x_p], dtype=np.float32)
     Xv = np.array([x_v], dtype=np.float32)
     Xs = np.array([x_s], dtype=np.float32)
     Xe = np.array([x_e], dtype=np.float32)
 
-    y_pred = model.predict([Xp, Xv, Xs, Xe], verbose=0).reshape(-1)[0]
+    y_pred_log = float(model.predict([Xp, Xv, Xs, Xe], verbose=0).reshape(-1)[0])
+    y_pred_log = max(y_pred_log, 0.0)
+    y_pred_abs = float(np.expm1(y_pred_log))
 
     st.subheader("Results")
-    st.write(f"Predicted value (log scale): **{y_pred:.4f}**")
-    if output_raw_scale:
-        st.write(f"Predicted value (original scale, expm1): **{np.expm1(y_pred):.4f}**")
+    st.write(f"Predicted value, log scale: **{y_pred_log:.4f}**")
 
-    with st.expander("Debug: input vectors & selections"):
-        st.json(
-            {
-                "skin_meta": {
-                    "Mode": mode,
-                    "Skin Type (for thickness)": st.session_state.cat_defaults.get("Skin Type"),
-                },
-                "x_p": dict(zip(PHY_CHEM, x_p)),
-                "x_v": dict(zip(VEHICLE, x_v)),
-                "x_s": dict(zip(SKIN, x_s)),
-                "x_e": dict(zip(EXPER, x_e)),
-            }
+    if output_raw_scale:
+        st.write(
+            "Predicted MM-converted dermal absorption at "
+            "100 ug/cm2 active dose: "
+            f"**{y_pred_abs:.4f}%**"
         )
 
-    with st.expander("Scaler parameter summary"):
-        st.dataframe(params_df)
+    if show_debug:
+        with st.expander("Debug: input vectors and selections", expanded=True):
+            st.json(
+                {
+                    "raw_input_after_training_transforms": raw_model,
+                    "category_values": cat_vals,
+                    "x_p": dict(zip(PHY_CHEM, x_p)),
+                    "x_v": dict(zip(VEHICLE, x_v)),
+                    "x_s": dict(zip(SKIN, x_s)),
+                    "x_e": dict(zip(EXPER, x_e)),
+                }
+            )
+
+        with st.expander("Scaler parameter summary"):
+            st.dataframe(params_df)
